@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-electron/
+release/
+out/
+
+# Logs & debug
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / tooling
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+coverage/
+
+# Electron / caches
+*.asar
+.cache/
+
+# TypeScript
+*.tsbuildinfo
+
+# Test
+.nyc_output/

@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- CSP 由 Electron main（session.onHeadersReceived）统一设置，避免与 Vite 开发态内联脚本冲突 -->
+    <title>Laika</title>
+  </head>
+  <body class="bg-surface text-gray-100 antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/renderer/main.tsx"></script>
+  </body>
+</html>
