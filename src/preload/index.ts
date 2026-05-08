@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import {
   IPC_CHANNELS,
   IPC_WORKSPACE_INFO,
+  IPC_WORKSPACE_RESOLVE,
   IPCResponse,
   FileInfo,
   NetworkResponse,
@@ -57,6 +58,8 @@ const api = {
         workspaceRoot: string;
       }>
     > => ipcRenderer.invoke(IPC_WORKSPACE_INFO),
+    resolvePath: (path: string): Promise<IPCResponse<{ absolute: string }>> =>
+      ipcRenderer.invoke(IPC_WORKSPACE_RESOLVE, { path }),
   },
 };
 

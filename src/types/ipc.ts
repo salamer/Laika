@@ -39,3 +39,4 @@ export interface NetworkResponse {
 }
 
 export const IPC_WORKSPACE_INFO = 'workspace:info' as const;
+export const IPC_WORKSPACE_RESOLVE = 'workspace:resolve' as const;

@@ -69,6 +69,18 @@ export function usePyodideWorker() {
             result = null;
             break;
           }
+          case 'workspaceInfo': {
+            const response = await window.electronAPI.workspace.info();
+            if (!response.success) throw new Error(response.error);
+            result = JSON.stringify(response.data);
+            break;
+          }
+          case 'workspaceResolvePath': {
+            const response = await window.electronAPI.workspace.resolvePath(args[0] as string);
+            if (!response.success) throw new Error(response.error);
+            result = JSON.stringify(response.data);
+            break;
+          }
           case 'httpRequest': {
             const raw = args[0];
             const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;

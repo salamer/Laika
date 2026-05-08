@@ -71,6 +71,8 @@ const hostAPIBridge = {
   writeFile: (path: string, content: string) => hostCall<void>('writeFile', [path, content], 15_000),
   listFiles: (path = '.') => hostCall<unknown[]>('listFiles', [path], 15_000),
   mkdir: (path: string) => hostCall<void>('mkdir', [path], 15_000),
+  getWorkspaceInfo: () => hostCall<string>('workspaceInfo', [], 5_000),
+  resolveWorkspacePath: (path: string) => hostCall<string>('workspaceResolvePath', [path], 5_000),
   httpRequest: (options: unknown) =>
     hostCall<string>(
       'httpRequest',
@@ -158,6 +160,18 @@ async def laika_list_files(path: str = "."):
     """列目录；每项含 name, path, isDirectory, size, modified。"""
     items = await hostAPI.listFiles(path)
     return items.to_py() if hasattr(items, "to_py") else list(items)
+
+
+async def laika_workspace_info():
+    """返回 { virtualRoot, workspaceRoot }；workspaceRoot 即本机工作区绝对路径（与侧栏一致）。"""
+    raw = await hostAPI.getWorkspaceInfo()
+    return json.loads(raw)
+
+
+async def laika_resolve_local_path(virtual_path: str) -> str:
+    """虚路径 -> 本机绝对路径（便于在 Finder/资源管理器里找文件）。读写仍请用 laika_read_file 等虚路径。"""
+    raw = await hostAPI.resolveWorkspacePath(virtual_path)
+    return json.loads(raw)["absolute"]
 `);
 
     const bundled = [...PRELOAD_PYODIDE_PACKAGES];
