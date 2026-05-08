@@ -7,6 +7,11 @@ export const IPC_CHANNELS = {
 
   NETWORK_REQUEST: 'network:request',
 
+  /** Chromium (hidden BrowserWindow) — all gated + URL policy in main. */
+  BROWSER_GET_HTML: 'browser:get-html',
+  BROWSER_SCREENSHOT: 'browser:screenshot',
+  BROWSER_EVALUATE: 'browser:evaluate',
+
   CONFIG_GET: 'config:get',
   CONFIG_SET_WORKSPACE: 'config:set-workspace',
   DIALOG_SELECT_WORKSPACE: 'dialog:select-workspace',

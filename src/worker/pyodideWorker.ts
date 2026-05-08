@@ -70,6 +70,23 @@ function hostCall<T>(method: string, args: unknown[], timeoutMs: number): Promis
   });
 }
 
+function pyOptsToJson(opts: unknown): string {
+  if (typeof opts === 'string') return opts;
+  const o = opts as { toJs?: (x?: unknown) => unknown };
+  if (opts && typeof o.toJs === 'function') {
+    try {
+      return JSON.stringify(o.toJs({ dict_converter: Object.fromEntries }));
+    } catch {
+      /* fall through */
+    }
+  }
+  try {
+    return JSON.stringify(opts);
+  } catch {
+    throw new Error('browser: options must be a dict/str serializable to JSON');
+  }
+}
+
 const hostAPIBridge = {
   readFile: (path: string) => hostCall<string>('readFile', [path], 15_000),
   writeFile: (path: string, content: string) => hostCall<void>('writeFile', [path, content], 15_000),
@@ -85,6 +102,26 @@ const hostAPIBridge = {
     ),
   deleteFile: (path: string, recursive: boolean) =>
     hostCall<void>('deleteFile', [path, recursive], 30_000),
+  /** Low-level: JSON string payload (for advanced Python `json.dumps`). */
+  browserGetHtml: (optsJson: string) =>
+    hostCall<string>('browserGetHtml', [optsJson], 180_000),
+  browserScreenshot: (optsJson: string) =>
+    hostCall<string>('browserScreenshot', [optsJson], 180_000),
+  browserEvaluate: (optsJson: string) =>
+    hostCall<string>('browserEvaluate', [optsJson], 180_000),
+  /** `await hostAPI.browser.getHtml({"url": "https://..."})` — Pyodide dict → JSON. */
+  browser: {
+    getHtml: (opts: unknown) =>
+      hostCall<string>('browserGetHtml', [pyOptsToJson(opts)], 180_000),
+    screenshot: async (opts: unknown) => {
+      const raw = await hostCall<string>('browserScreenshot', [pyOptsToJson(opts)], 180_000);
+      return JSON.parse(raw) as { path: string; width: number; height: number };
+    },
+    evaluate: async (opts: unknown) => {
+      const raw = await hostCall<string>('browserEvaluate', [pyOptsToJson(opts)], 180_000);
+      return JSON.parse(raw) as unknown;
+    },
+  },
 };
 
 (globalThis as unknown as { hostAPI: typeof hostAPIBridge }).hostAPI = hostAPIBridge;

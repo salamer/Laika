@@ -23,7 +23,7 @@ const folderDialogOptions: OpenDialogOptions = {
 export function registerConfigHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.CONFIG_GET, (): { success: true; data: AppSettings } => {
     const { workspaceRoot } = loadSettings();
-    return { success: true, data: { workspaceRoot, configFilePath: settingsFilePath() } };
+    return { success: true, data: { workspaceRoot, configFilePath: settingsFilePath(), browserAllowedHosts: ['*'] } };
   });
 
   ipcMain.handle(

@@ -33,7 +33,7 @@ function isNonPublicIPv4(host: string): boolean {
   return false;
 }
 
-function isNonPublicHostname(host: string): boolean {
+export function isNonPublicHostname(host: string): boolean {
   const h = host.toLowerCase();
   if (h === 'localhost' || h === '0.0.0.0' || h === '::' || h === '[::]') return true;
   if (h.endsWith('.localhost')) return true;

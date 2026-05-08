@@ -7,6 +7,7 @@ import { attachNetworkGuards } from './network';
 import { loadSettings } from './configStore';
 import { setWorkspaceRoot } from './workspaceContext';
 import { getMainBundledDirs } from './paths';
+import { disposeBrowserRuntime } from './browserRuntime';
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 const bundled = getMainBundledDirs();
@@ -151,6 +152,10 @@ app.whenReady().then(async () => {
       void createWindow();
     }
   });
+});
+
+app.on('before-quit', () => {
+  disposeBrowserRuntime();
 });
 
 app.on('window-all-closed', () => {

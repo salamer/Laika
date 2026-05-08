@@ -2,6 +2,7 @@ import { ipcMain } from 'electron';
 import { registerFileHandlers } from './fileHandlers';
 import { registerNetworkHandlers } from './networkHandlers';
 import { registerConfigHandlers } from './configHandlers';
+import { registerBrowserHandlers } from './browserHandlers';
 import { auditLog } from '../security/audit';
 import { IPC_WORKSPACE_INFO, IPC_WORKSPACE_RESOLVE } from '../../types/ipc';
 import { getPathValidator } from '../workspaceContext';
@@ -10,6 +11,7 @@ export function registerAllIPCHandlers(): void {
   registerFileHandlers();
   registerNetworkHandlers();
   registerConfigHandlers();
+  registerBrowserHandlers();
 
   ipcMain.handle(IPC_WORKSPACE_INFO, () => ({
     success: true,

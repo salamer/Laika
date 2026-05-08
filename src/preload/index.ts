@@ -58,6 +58,30 @@ const api = {
     > => ipcRenderer.invoke(IPC_CHANNELS.DIALOG_SELECT_WORKSPACE),
   },
 
+  browser: {
+    getHtml: (opts: {
+      url: string;
+      timeoutMs?: number;
+      waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+    }): Promise<IPCResponse<string>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BROWSER_GET_HTML, { ...opts, requestId: rid() }),
+    screenshot: (opts: {
+      url: string;
+      path: string;
+      fullPage?: boolean;
+      timeoutMs?: number;
+      waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+    }): Promise<IPCResponse<string>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BROWSER_SCREENSHOT, { ...opts, requestId: rid() }),
+    evaluate: (opts: {
+      url: string;
+      script: string;
+      timeoutMs?: number;
+      waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+    }): Promise<IPCResponse<string>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BROWSER_EVALUATE, { ...opts, requestId: rid() }),
+  },
+
   workspace: {
     info: (): Promise<
       IPCResponse<{

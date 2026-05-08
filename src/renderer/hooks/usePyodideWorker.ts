@@ -99,6 +99,42 @@ export function usePyodideWorker() {
             result = JSON.stringify(response.data);
             break;
           }
+          case 'browserGetHtml': {
+            const opts = JSON.parse(args[0] as string) as {
+              url: string;
+              timeoutMs?: number;
+              waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+            };
+            const response = await window.electronAPI.browser.getHtml(opts);
+            if (!response.success) throw new Error(response.error);
+            result = response.data;
+            break;
+          }
+          case 'browserScreenshot': {
+            const opts = JSON.parse(args[0] as string) as {
+              url: string;
+              path: string;
+              fullPage?: boolean;
+              timeoutMs?: number;
+              waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+            };
+            const response = await window.electronAPI.browser.screenshot(opts);
+            if (!response.success) throw new Error(response.error);
+            result = response.data;
+            break;
+          }
+          case 'browserEvaluate': {
+            const opts = JSON.parse(args[0] as string) as {
+              url: string;
+              script: string;
+              timeoutMs?: number;
+              waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+            };
+            const response = await window.electronAPI.browser.evaluate(opts);
+            if (!response.success) throw new Error(response.error);
+            result = response.data;
+            break;
+          }
           default:
             throw new Error(`Unknown host method: ${method}`);
         }

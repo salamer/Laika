@@ -17,7 +17,19 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron/main',
             rollupOptions: {
-              external: ['electron', 'path', 'fs', 'os', 'crypto', 'url'],
+              external: [
+                'electron',
+                'path',
+                'fs',
+                'fs/promises',
+                'os',
+                'crypto',
+                'url',
+                'playwright',
+                'playwright-core',
+                'child_process',
+                'dns/promises',
+              ],
               output: {
                 format: 'cjs',
               },
