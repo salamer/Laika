@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { auditLog } from '../security/audit';
 
 export function initWorkspace(workspacePath: string): void {
@@ -8,7 +9,7 @@ export function initWorkspace(workspacePath: string): void {
   }
 
   for (const dir of ['data', 'outputs', 'temp', 'packages']) {
-    const fullPath = `${workspacePath}/${dir}`;
+    const fullPath = join(workspacePath, dir);
     if (!existsSync(fullPath)) {
       mkdirSync(fullPath, { recursive: true });
     }

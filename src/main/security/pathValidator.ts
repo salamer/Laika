@@ -1,13 +1,26 @@
-import { resolve, normalize, sep, isAbsolute } from 'node:path';
+import { resolve, normalize, sep, relative, isAbsolute } from 'node:path';
 
 /**
  * Resolve user paths inside a single workspace root and reject traversal / absolute paths.
+ * Uses `path.relative` so containment works on Windows (drive letters, case differences).
  */
 export class PathValidator {
   private readonly workspaceRoot: string;
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = resolve(normalize(workspaceRoot));
+  }
+
+  /** True if `target` is the workspace root or a path strictly inside it (same volume). */
+  private containsResolvedTarget(targetAbs: string): boolean {
+    const root = this.workspaceRoot;
+    const target = resolve(normalize(targetAbs));
+    if (target === root) return true;
+    const rel = relative(root, target);
+    if (!rel) return true;
+    if (isAbsolute(rel)) return false;
+    const segments = rel.split(sep);
+    return !segments.some((s) => s === '..');
   }
 
   validate(userPath: string): string {
@@ -25,10 +38,7 @@ export class PathValidator {
 
     const absolutePath = resolve(this.workspaceRoot, normalized);
 
-    const root = this.workspaceRoot;
-    const isRoot = absolutePath === root;
-    const underRoot = absolutePath.startsWith(root + sep);
-    if (!isRoot && !underRoot) {
+    if (!this.containsResolvedTarget(absolutePath)) {
       throw new PathValidationError(
         `Path traversal detected. "${userPath}" resolves outside the workspace.`
       );
@@ -38,13 +48,13 @@ export class PathValidator {
   }
 
   toVirtualPath(absolutePath: string): string {
-    const root = this.workspaceRoot;
-    if (absolutePath === root) return '/';
-    const prefix = root + sep;
-    if (!absolutePath.startsWith(prefix)) {
+    const resolved = resolve(normalize(absolutePath));
+    if (!this.containsResolvedTarget(resolved)) {
       throw new PathValidationError('Path is outside workspace.');
     }
-    const rel = absolutePath.slice(prefix.length);
+    const root = this.workspaceRoot;
+    if (resolved === root) return '/';
+    const rel = relative(root, resolved);
     return rel.split(sep).join('/');
   }
 

@@ -6,15 +6,29 @@ import { initAuditLog } from './security/audit';
 import { attachNetworkGuards } from './network';
 import { loadSettings } from './configStore';
 import { setWorkspaceRoot } from './workspaceContext';
+import { getMainBundledDirs } from './paths';
 
-process.env.DIST_ELECTRON = join(__dirname);
-process.env.DIST = join(process.env.DIST_ELECTRON, '../dist');
-process.env.VITE_PUBLIC = process.env.VITE_DEV_SERVER_URL
-  ? join(process.env.DIST_ELECTRON, '../public')
-  : process.env.DIST;
-
-const preloadPath = join(__dirname, '../preload/index.js');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
+const bundled = getMainBundledDirs();
+const preloadPath = bundled.preload;
+
+process.on('uncaughtException', (err) => {
+  console.error('[main] uncaughtException:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[main] unhandledRejection:', reason);
+});
+
+if (process.platform === 'win32') {
+  /** 与 package.json build.appId 一致；影响任务栏跳转列表、通知等。 */
+  app.setAppUserModelId('com.laika.desktop');
+}
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+  process.exit(0);
+}
 
 function contentSecurityPolicy(): string {
   const isDev = Boolean(VITE_DEV_SERVER_URL);
@@ -47,6 +61,13 @@ function contentSecurityPolicy(): string {
 }
 
 let mainWindow: BrowserWindow | null = null;
+
+function focusMainWindow(): void {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
 
 async function createWindow(): Promise<void> {
   /** 开发直连 Vite：窗口先显示，避免 ready-to-show 偶尔不触发时一直隐藏。 */
@@ -87,7 +108,7 @@ async function createWindow(): Promise<void> {
     await mainWindow.loadURL(VITE_DEV_SERVER_URL);
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    await mainWindow.loadFile(join(process.env.DIST!, 'index.html'));
+    await mainWindow.loadFile(join(bundled.rendererDistDir, 'index.html'));
   }
 
   mainWindow.once('ready-to-show', () => {
@@ -99,6 +120,10 @@ async function createWindow(): Promise<void> {
     mainWindow = null;
   });
 }
+
+app.on('second-instance', () => {
+  focusMainWindow();
+});
 
 app.whenReady().then(async () => {
   const settings = loadSettings();
@@ -123,7 +148,7 @@ app.whenReady().then(async () => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      void createWindow();
     }
   });
 });

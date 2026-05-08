@@ -1,6 +1,6 @@
 import { app } from 'electron';
-import { join } from 'path';
-import { appendFileSync, mkdirSync, existsSync } from 'fs';
+import { join } from 'node:path';
+import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
 
 /**
  * 审计日志 — 记录所有安全相关操作

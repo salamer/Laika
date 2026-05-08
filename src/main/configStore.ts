@@ -9,8 +9,9 @@ export interface PersistedConfig {
 
 const FILE_NAME = 'laika-settings.json';
 
+/** 默认工作区：用户「文档」下的子目录，避免占满家目录且与 macOS / Windows 习惯一致。 */
 export function defaultWorkspacePath(): string {
-  return resolve(app.getPath('home'), 'AppWorkspace');
+  return resolve(app.getPath('documents'), 'Laika');
 }
 
 export function settingsFilePath(): string {

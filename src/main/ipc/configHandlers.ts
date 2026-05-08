@@ -1,4 +1,4 @@
-import { ipcMain, dialog, BrowserWindow } from 'electron';
+import { ipcMain, dialog, BrowserWindow, app } from 'electron';
 import type { OpenDialogOptions } from 'electron';
 import { resolve } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -14,7 +14,9 @@ type SetWorkspaceResult =
   | { success: false; error: string };
 
 const folderDialogOptions: OpenDialogOptions = {
-  title: '选择 Python 可访问的文件夹',
+  title: 'Select workspace folder',
+  buttonLabel: 'Choose',
+  defaultPath: app.getPath('documents'),
   properties: ['openDirectory', 'createDirectory'],
 };
 
