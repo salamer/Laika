@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron';
-import { readFile, writeFile, mkdir, readdir, stat, unlink } from 'fs/promises';
+import { readFile, writeFile, mkdir, readdir, stat, unlink, rm } from 'fs/promises';
 import { PathValidationError } from '../security/pathValidator';
 import { auditLog } from '../security/audit';
 import { IPC_CHANNELS, FileInfo } from '../../types/ipc';
@@ -78,14 +78,20 @@ export function registerFileHandlers(): void {
     }
   });
 
-  ipcMain.handle(IPC_CHANNELS.FILE_DELETE, async (_event, payload: { path: string; requestId: string }) => {
+  ipcMain.handle(
+    IPC_CHANNELS.FILE_DELETE,
+    async (_event, payload: { path: string; recursive?: boolean; requestId: string }) => {
     try {
       const pathValidator = getPathValidator();
       const safePath = pathValidator.validate(payload.path);
       if (safePath === pathValidator.getWorkspaceRoot()) {
         return { success: false, error: 'Cannot delete workspace root', requestId: payload.requestId };
       }
-      await unlink(safePath);
+      if (payload.recursive) {
+        await rm(safePath, { recursive: true, force: true });
+      } else {
+        await unlink(safePath);
+      }
       auditLog.info('FILE_DELETE', { virtualPath: payload.path, safePath });
       return { success: true, requestId: payload.requestId };
     } catch (error) {

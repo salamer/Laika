@@ -10,6 +10,9 @@ export interface WorkerExecuteCommand {
     code: string;
     timeoutMs?: number;
     requestId: string;
+    /** Bash/shell interpreted by bashlex in Pyodide (laika_shell). */
+    mode?: 'python' | 'shell';
+    resetShellSession?: boolean;
   };
 }
 

@@ -1,7 +1,11 @@
 /// <reference lib="webworker" />
 
-import type { WorkerCommand, WorkerResponse } from '../types/worker';
+import type { WorkerCommand, WorkerExecuteCommand, WorkerResponse } from '../types/worker';
 import { PRELOAD_PYODIDE_PACKAGES, PRELOAD_PYPI_PACKAGES } from './preloadPackages';
+
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-expect-error Vite raw import
+import laikaShellSource from './python/laika_shell.py?raw';
 
 const PYODIDE_VERSION = '0.25.1';
 const PYODIDE_CDN = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -79,6 +83,8 @@ const hostAPIBridge = {
       [typeof options === 'string' ? options : JSON.stringify(options)],
       60_000
     ),
+  deleteFile: (path: string, recursive: boolean) =>
+    hostCall<void>('deleteFile', [path, recursive], 30_000),
 };
 
 (globalThis as unknown as { hostAPI: typeof hostAPIBridge }).hostAPI = hostAPIBridge;
@@ -172,6 +178,11 @@ async def laika_resolve_local_path(virtual_path: str) -> str:
     """虚路径 -> 本机绝对路径（便于在 Finder/资源管理器里找文件）。读写仍请用 laika_read_file 等虚路径。"""
     raw = await hostAPI.resolveWorkspacePath(virtual_path)
     return json.loads(raw)["absolute"]
+
+
+async def laika_delete_file(path: str, recursive: bool = False) -> None:
+    """删除工作区内文件或目录；recursive=True 时递归删除目录。"""
+    await hostAPI.deleteFile(path, recursive)
 `);
 
     const bundled = [...PRELOAD_PYODIDE_PACKAGES];
@@ -185,6 +196,11 @@ async def laika_resolve_local_path(virtual_path: str) -> str:
       emitStdout(`[Laika] micropip: ${pypiExtra.join(', ')}\n`);
       await preloadMicropipPackages(runtime, pypiExtra);
     }
+
+    emitStdout('[Laika] compiling laika_shell.py (bashlex)\\n');
+    await runtime.runPythonAsync(
+      `exec(compile(${JSON.stringify(laikaShellSource)}, 'laika_shell.py', 'exec'))`
+    );
 
     pyodide = runtime;
     isInitialized = true;
@@ -216,7 +232,22 @@ async def laika_resolve_local_path(virtual_path: str) -> str:
   }
 }
 
-async function executePython(code: string, timeoutMs = 30_000): Promise<void> {
+function buildRunSource(payload: WorkerExecuteCommand['payload']): string {
+  const mode = payload.mode ?? 'python';
+  if (mode !== 'shell') return payload.code;
+  const parts: string[] = [];
+  if (payload.resetShellSession) parts.push('await laika_reset_shell_session()');
+  if (payload.code.trim()) {
+    parts.push(
+      `(await laika_run_shell(__import__("json").loads(${JSON.stringify(JSON.stringify(payload.code))})))`
+    );
+  }
+  if (parts.length === 0) parts.push('0');
+  return parts.join('\n');
+}
+
+async function executePython(payload: WorkerExecuteCommand['payload'], timeoutMs: number): Promise<void> {
+  const code = buildRunSource(payload);
   if (!isInitialized || !pyodide) {
     emitMessage({
       type: 'ERROR',
@@ -337,7 +368,7 @@ self.onmessage = async (
 
     case 'EXECUTE':
       currentRequestId = command.payload.requestId;
-      await executePython(command.payload.code, command.payload.timeoutMs ?? 30_000);
+      await executePython(command.payload, command.payload.timeoutMs ?? 30_000);
       break;
 
     case 'INSTALL_PACKAGE':

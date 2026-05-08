@@ -10,6 +10,9 @@ interface WorkerState {
 
 export type ExecuteOptions = {
   timeoutMs?: number;
+  /** When set to `shell`, `code` is parsed with bashlex and run in Python. */
+  mode?: 'python' | 'shell';
+  resetShellSession?: boolean;
   /** stdout/stderr chunks for this run only (request-scoped). */
   onStream?: (stream: 'stdout' | 'stderr', text: string) => void;
 };
@@ -42,6 +45,13 @@ export function usePyodideWorker() {
         let result: unknown;
 
         switch (method) {
+          case 'deleteFile': {
+            const recursive = Boolean(args[1]);
+            const response = await window.electronAPI.file.delete(args[0] as string, { recursive });
+            if (!response.success) throw new Error(response.error);
+            result = null;
+            break;
+          }
           case 'readFile': {
             const response = await window.electronAPI.file.readFile(args[0] as string);
             if (!response.success) throw new Error(response.error);
@@ -218,7 +228,13 @@ export function usePyodideWorker() {
 
       worker.postMessage({
         type: 'EXECUTE',
-        payload: { code, timeoutMs, requestId },
+        payload: {
+          code,
+          timeoutMs,
+          requestId,
+          mode: options?.mode ?? 'python',
+          resetShellSession: options?.resetShellSession,
+        },
       } as WorkerCommand);
     });
   }, []);

@@ -31,6 +31,10 @@ Thumbs.db
 *.swo
 coverage/
 
+# Local Python venvs (dev only)
+.venv-bashlex/
+.venv-shelltest/
+
 # Electron / caches
 *.asar
 .cache/

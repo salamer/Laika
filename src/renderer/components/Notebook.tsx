@@ -32,9 +32,12 @@ function emptyCell(): Cell {
   };
 }
 
+type KernelMode = 'python' | 'shell';
+
 export default function Notebook() {
   const [cells, setCells] = useState<Cell[]>(() => [emptyCell()]);
   const [initError, setInitError] = useState<string | null>(null);
+  const [kernelMode, setKernelMode] = useState<KernelMode>('python');
   const initRef = useRef(false);
   const cellsRef = useRef(cells);
   const execSeqRef = useRef(0);
@@ -97,7 +100,11 @@ export default function Notebook() {
       };
 
       try {
-        const result = await execute(code, { onStream, timeoutMs: 120_000 });
+        const result = await execute(code, {
+          onStream,
+          timeoutMs: 120_000,
+          mode: kernelMode === 'shell' ? 'shell' : 'python',
+        });
         setCells((prev) =>
           prev.map((c) => {
             if (c.id !== cellId) return c;
@@ -107,7 +114,10 @@ export default function Notebook() {
                 typeof result.result === 'string'
                   ? result.result
                   : JSON.stringify(result.result, null, 2);
-              out.push({ kind: 'result', text: s });
+              out.push({
+                kind: 'result',
+                text: kernelMode === 'shell' ? `退出码 ${s}` : s,
+              });
             }
             return {
               ...c,
@@ -125,7 +135,7 @@ export default function Notebook() {
         );
       }
     },
-    [status.state, execute, appendChunk]
+    [status.state, kernelMode, execute, appendChunk]
   );
 
   const runAll = useCallback(async () => {
@@ -167,43 +177,83 @@ export default function Notebook() {
     }
   }, [restart]);
 
+  const handleResetShellSession = useCallback(async () => {
+    await execute('', { mode: 'shell', resetShellSession: true });
+  }, [execute]);
+
+  const canRunCell = status.state === 'ready';
+  const anyRunning = cells.some((c) => c.runState === 'running');
+
   const kernelLabel =
-    status.state === 'ready'
-      ? '内核就绪'
-      : status.state === 'initializing'
-        ? '正在加载 Pyodide…'
-        : status.state === 'busy'
-          ? '运行中…'
-          : status.state === 'error'
-            ? '内核错误'
-            : status.state === 'terminated'
-              ? '已停止'
-              : status.state === 'uninitialized'
-                ? '未启动'
-                : status.state;
+    kernelMode === 'shell'
+      ? 'Shell（bashlex + Pyodide）'
+      : status.state === 'ready'
+        ? '内核就绪'
+        : status.state === 'initializing'
+          ? '正在加载 Pyodide…'
+          : status.state === 'busy'
+            ? '运行中…'
+            : status.state === 'error'
+              ? '内核错误'
+              : status.state === 'terminated'
+                ? '已停止'
+                : status.state === 'uninitialized'
+                  ? '未启动'
+                  : status.state;
+
+  const statusClass = anyRunning
+    ? 'bg-amber-400 animate-pulse'
+    : canRunCell
+      ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]'
+      : 'bg-zinc-500';
 
   return (
     <div className="flex flex-col flex-1 min-h-0 min-w-0 bg-gradient-to-b from-[#0f0f12] to-[#121218]">
       <div className="shrink-0 px-5 py-3 border-b border-white/[0.06] flex flex-wrap items-center gap-3 bg-[#12121a]/90 backdrop-blur-sm">
         <div className="flex items-center gap-2">
-          <span
-            className={`h-2 w-2 rounded-full ${
-              status.state === 'ready'
-                ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]'
-                : status.state === 'busy'
-                  ? 'bg-amber-400 animate-pulse'
-                  : 'bg-zinc-500'
-            }`}
-          />
+          <span className={`h-2 w-2 rounded-full ${statusClass}`} />
           <span className="text-xs font-medium text-zinc-300">{kernelLabel}</span>
           {status.pyodideVersion ? (
             <span className="text-2xs text-zinc-600 font-mono">{status.pyodideVersion}</span>
           ) : null}
         </div>
+        <div className="flex rounded-lg border border-white/[0.08] p-0.5 bg-[#0d0d11]/80">
+          <button
+            type="button"
+            className={`rounded-md px-2.5 py-1 text-2xs font-medium transition-colors ${
+              kernelMode === 'python'
+                ? 'bg-zinc-700 text-zinc-100'
+                : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+            onClick={() => setKernelMode('python')}
+          >
+            Python
+          </button>
+          <button
+            type="button"
+            className={`rounded-md px-2.5 py-1 text-2xs font-medium transition-colors ${
+              kernelMode === 'shell'
+                ? 'bg-sky-700/80 text-sky-100'
+                : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+            onClick={() => setKernelMode('shell')}
+          >
+            Shell
+          </button>
+        </div>
         <div className="flex-1" />
         <button
           type="button"
-          disabled={status.state !== 'ready'}
+          disabled={kernelMode !== 'shell' || !canRunCell}
+          className="rounded-lg px-3 py-1.5 text-xs font-medium bg-sky-600/15 text-sky-200 border border-sky-500/25 hover:bg-sky-600/25 disabled:opacity-25 disabled:pointer-events-none transition-colors"
+          title="清除 Shell 会话中的 cd / export 等状态"
+          onClick={() => void handleResetShellSession()}
+        >
+          重置 Shell 会话
+        </button>
+        <button
+          type="button"
+          disabled={!canRunCell}
           className="rounded-lg px-3 py-1.5 text-xs font-medium bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 disabled:opacity-40 disabled:pointer-events-none transition-colors"
           onClick={() => addCell()}
         >
@@ -211,7 +261,7 @@ export default function Notebook() {
         </button>
         <button
           type="button"
-          disabled={status.state !== 'ready'}
+          disabled={!canRunCell}
           className="rounded-lg px-3 py-1.5 text-xs font-medium bg-violet-600/20 text-violet-200 border border-violet-500/25 hover:bg-violet-600/30 disabled:opacity-40 disabled:pointer-events-none transition-colors"
           onClick={() => void runAll()}
         >
@@ -242,7 +292,7 @@ export default function Notebook() {
             <div className="flex items-center gap-2 px-3 py-2 bg-[#1a1a24] border-b border-white/[0.05]">
               <button
                 type="button"
-                disabled={status.state !== 'ready' || cell.runState === 'running'}
+                disabled={!canRunCell || cell.runState === 'running'}
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25 disabled:opacity-35 transition-colors"
                 title="运行此单元 (Shift+Enter)"
                 onClick={() => void runCell(cell.id)}
@@ -284,7 +334,12 @@ export default function Notebook() {
               value={cell.source}
               onChange={(v) => updateSource(cell.id, v)}
               onRun={() => void runCell(cell.id)}
-              readOnly={status.state !== 'ready' || cell.runState === 'running'}
+              readOnly={!canRunCell || cell.runState === 'running'}
+              placeholder={
+                kernelMode === 'shell'
+                  ? '输入 Shell/Bash…（bashlex [idank/bashlex] 解析，见 help）。Shift+Enter 运行'
+                  : '输入 Python… Shift+Enter 运行本单元'
+              }
             />
             {cell.outputs.length > 0 ? (
               <div className="border-t border-white/[0.06] bg-[#0a0a0d] px-4 py-3 space-y-1.5">

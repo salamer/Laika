@@ -15,4 +15,4 @@ export const PRELOAD_PYODIDE_PACKAGES: readonly string[] = [
  * 不在官方构建里的包可在此用 micropip 安装（需可访问 PyPI / 兼容 Pyodide；纯 Python 包成功率更高）。
  * `beautifulsoup4` 用于解析 HTML（与内核里注入的 `laika_http_get` 配合爬取公网页面）。
  */
-export const PRELOAD_PYPI_PACKAGES: readonly string[] = ['beautifulsoup4'];
+export const PRELOAD_PYPI_PACKAGES: readonly string[] = ['beautifulsoup4', 'bashlex'];

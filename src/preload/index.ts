@@ -27,8 +27,15 @@ const api = {
       ipcRenderer.invoke(IPC_CHANNELS.FILE_LIST, { path: path ?? '.', requestId: rid() }),
     mkdir: (path: string): Promise<IPCResponse<void>> =>
       ipcRenderer.invoke(IPC_CHANNELS.FILE_MKDIR, { path, requestId: rid() }),
-    delete: (path: string): Promise<IPCResponse<void>> =>
-      ipcRenderer.invoke(IPC_CHANNELS.FILE_DELETE, { path, requestId: rid() }),
+    delete: (
+      path: string,
+      options?: { recursive?: boolean }
+    ): Promise<IPCResponse<void>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.FILE_DELETE, {
+        path,
+        recursive: options?.recursive ?? false,
+        requestId: rid(),
+      }),
   },
 
   network: {

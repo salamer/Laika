@@ -32,7 +32,6 @@ export default function PythonCellEditor({
 
   const extensions = useMemo(
     () => [
-      /* 不用 python()：它自带关键字/局部补全；仅要高亮与缩进时用 LanguageSupport(pythonLanguage) */
       new LanguageSupport(pythonLanguage),
       Prec.highest(
         keymap.of([
