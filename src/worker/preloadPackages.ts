@@ -21,4 +21,5 @@ export const PRELOAD_PYPI_PACKAGES: readonly string[] = [
   'openpyxl',
   'python-docx',
   'python-pptx',
+  'markdownify',
 ];

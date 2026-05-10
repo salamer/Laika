@@ -140,12 +140,11 @@ async function runUserScript(wc: WebContents, script: string): Promise<unknown> 
   return wc.executeJavaScript(`(function(){ return ( ${trimmed} ); })()`, true);
 }
 
-export async function browserGetHtml(payload: BrowserGetHtmlPayload): Promise<string> {
+async function getRenderedOuterHtml(payload: BrowserGetHtmlPayload): Promise<string> {
   assertBrowserNavUrl(payload.url);
   const waitUntil = payload.waitUntil ?? 'load';
   const timeoutMs = Math.min(Math.max(payload.timeoutMs ?? 60_000, 5_000), 180_000);
   const win = getOrCreateWindow();
-  auditLog.info('BROWSER_GET_HTML', { url: payload.url, waitUntil });
 
   await navigateAndWait(win, payload.url, waitUntil, timeoutMs);
   const html = (await win.webContents.executeJavaScript(
@@ -157,6 +156,11 @@ export async function browserGetHtml(payload: BrowserGetHtmlPayload): Promise<st
     throw new Error(`HTML too large (${bytes} bytes, max ${MAX_HTML_BYTES})`);
   }
   return html;
+}
+
+export async function browserGetHtml(payload: BrowserGetHtmlPayload): Promise<string> {
+  auditLog.info('BROWSER_GET_HTML', { url: payload.url, waitUntil: payload.waitUntil ?? 'load' });
+  return getRenderedOuterHtml(payload);
 }
 
 export async function browserScreenshot(

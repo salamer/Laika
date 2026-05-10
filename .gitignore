@@ -44,3 +44,5 @@ coverage/
 
 # Test
 .nyc_output/
+
+*.pyc

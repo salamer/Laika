@@ -23,6 +23,8 @@ def _load_laika_shell():
     spec = importlib.util.spec_from_file_location("laika_shell", root / "laika_shell.py")
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
+    # 须先注册到 sys.modules，否则 @dataclass 在部分 Python 版本下解析注解会失败
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -159,12 +161,30 @@ def attach_mocks(fs: MemFS, http_fn: Optional[Callable] = None) -> None:
             return await http_fn(url, method, headers, body)
         return {"status": 200, "statusText": "OK", "headers": {}, "body": '{"ok":true}', "requestId": "t"}
 
+    async def laika_browser_get_html(url: str, wait_until: str = "load", timeout_ms: int = 60000) -> str:
+        return f"<html><body data-u=\"{url}\"></body></html>"
+
+    async def laika_browser_get_markdown(
+        url: str, wait_until: str = "load", timeout_ms: int = 60000, mode: str = "readability"
+    ) -> str:
+        return f"# page\n\n- {mode}: {url}\n"
+
+    async def laika_browser_evaluate(url: str, script: str, wait_until: str = "load", timeout_ms: int = 60000):
+        return {"url": url, "scriptLen": len(script)}
+
+    async def laika_browser_open_login(url: str) -> None:
+        pass
+
     _LS.laika_read_file = laika_read_file  # type: ignore[attr-defined]
     _LS.laika_write_file = laika_write_file  # type: ignore[attr-defined]
     _LS.laika_mkdir = laika_mkdir  # type: ignore[attr-defined]
     _LS.laika_list_files = laika_list_files  # type: ignore[attr-defined]
     _LS.laika_delete_file = laika_delete_file  # type: ignore[attr-defined]
     _LS.laika_http_request = laika_http_request  # type: ignore[attr-defined]
+    _LS.laika_browser_get_html = laika_browser_get_html  # type: ignore[attr-defined]
+    _LS.laika_browser_get_markdown = laika_browser_get_markdown  # type: ignore[attr-defined]
+    _LS.laika_browser_evaluate = laika_browser_evaluate  # type: ignore[attr-defined]
+    _LS.laika_browser_open_login = laika_browser_open_login  # type: ignore[attr-defined]
 
 
 async def run_case(

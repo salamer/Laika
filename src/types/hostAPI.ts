@@ -29,12 +29,6 @@ export interface HostHttpResponse {
  * Chromium via Electron Main hidden `BrowserWindow` (not in Pyodide).
  */
 
-export type HostBrowserGetHtml = {
-  url: string;
-  timeoutMs?: number;
-  waitUntil?: GotoWaitUntil;
-};
-
 export type HostBrowserScreenshot = {
   url: string;
   path: string;
@@ -66,6 +60,7 @@ export interface HostAPIBridge {
   browserGetHtml: (optsJson: string) => Promise<string>;
   browserScreenshot: (optsJson: string) => Promise<string>;
   browserEvaluate: (optsJson: string) => Promise<string>;
+  browserOpenLogin: (optsJson: string) => Promise<void>;
 
   browser: {
     getHtml: (opts: unknown) => Promise<string>;

@@ -1,6 +1,10 @@
 import { useState, useRef, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import type { WorkerCommand, WorkerResponse, WorkerResultResponse } from '../../types/worker';
+import { createBridgeLogger, summarizeHostArgs, summarizeHostResult } from '../../shared/bridgeLogger';
+
+/** 宿主侧：`HOST_CALL` 在此落地为 Electron IPC；结构与 Worker 对称。 */
+const log = createBridgeLogger('pyodideHostBridge');
 
 interface WorkerState {
   state: 'uninitialized' | 'initializing' | 'ready' | 'busy' | 'error' | 'terminated';
@@ -41,10 +45,20 @@ export function usePyodideWorker() {
 
   const handleHostCall = useCallback(
     async (worker: Worker, method: string, args: unknown[], requestId: string): Promise<void> => {
+      const t0 = performance.now();
+
+      /** 每条 Python→Worker→此处的宿主调用都打点；磁盘 IO 与方法名见 `summarizeHostArgs`。 */
+      log.debug('hostBridge:incoming', {
+        requestId,
+        method,
+        ...summarizeHostArgs(method, args),
+      });
+
       try {
         let result: unknown;
 
         switch (method) {
+          /** --- Workspace 文件读写（高频 IO） --- */
           case 'deleteFile': {
             const recursive = Boolean(args[1]);
             const response = await window.electronAPI.file.delete(args[0] as string, { recursive });
@@ -100,6 +114,7 @@ export function usePyodideWorker() {
             result = null;
             break;
           }
+          /** --- 工作区元数据（轻量 IPC） --- */
           case 'workspaceInfo': {
             const response = await window.electronAPI.workspace.info();
             if (!response.success) throw new Error(response.error);
@@ -112,6 +127,7 @@ export function usePyodideWorker() {
             result = JSON.stringify(response.data);
             break;
           }
+          /** --- 受控网络 / 浏览器自动化（可能较慢） --- */
           case 'httpRequest': {
             const raw = args[0];
             const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -129,6 +145,13 @@ export function usePyodideWorker() {
             const response = await window.electronAPI.browser.getHtml(opts);
             if (!response.success) throw new Error(response.error);
             result = response.data;
+            break;
+          }
+          case 'browserOpenLogin': {
+            const opts = JSON.parse(args[0] as string) as { url: string };
+            const response = await window.electronAPI.browser.openLogin(opts);
+            if (!response.success) throw new Error(response.error);
+            result = null;
             break;
           }
           case 'browserScreenshot': {
@@ -160,8 +183,22 @@ export function usePyodideWorker() {
             throw new Error(`Unknown host method: ${method}`);
         }
 
+        const elapsedMs = Math.round(performance.now() - t0);
+        log.debug('hostBridge:electronDone', {
+          requestId,
+          method,
+          elapsedMs,
+          ...summarizeHostResult(method, result),
+        });
+
         worker.postMessage({ type: 'HOST_RESPONSE', requestId, result });
       } catch (error) {
+        log.error('hostBridge:electronError', {
+          requestId,
+          method,
+          ...summarizeHostArgs(method, args),
+          error: error instanceof Error ? error.message : String(error),
+        });
         worker.postMessage({
           type: 'HOST_RESPONSE',
           requestId,
@@ -172,10 +209,14 @@ export function usePyodideWorker() {
     []
   );
 
+  /** 创建 DedicatedWorker；生命周期与 Pyodide 实例一一对应。 */
   const createWorker = useCallback((): Worker => {
     if (workerRef.current) {
+      log.debug('worker:terminate:previous');
       workerRef.current.terminate();
     }
+
+    log.info('worker:spawn');
 
     const worker = new Worker(new URL('../../worker/pyodideWorker.ts', import.meta.url), {
       type: 'module',
@@ -229,7 +270,7 @@ export function usePyodideWorker() {
     };
 
     worker.onerror = (error) => {
-      console.error('[Worker Error]', error);
+      log.error('worker:runtimeError', { message: error.message, filename: error.filename, lineno: error.lineno });
       setStatus((prev) => ({ ...prev, state: 'error' }));
     };
 
@@ -239,6 +280,7 @@ export function usePyodideWorker() {
 
   const initialize = useCallback(async (): Promise<void> => {
     const worker = createWorker();
+    log.info('pyodide:initialize:posted');
     setStatus({ state: 'initializing', uptimeMs: 0 });
 
     return new Promise((resolve, reject) => {
@@ -250,10 +292,12 @@ export function usePyodideWorker() {
         if (event.data.type === 'INITIALIZED') {
           worker.removeEventListener('message', handler);
           clearTimeout(timeout);
+          log.info('pyodide:initialize:ready');
           resolve();
         } else if (event.data.type === 'ERROR') {
           worker.removeEventListener('message', handler);
           clearTimeout(timeout);
+          log.error('pyodide:initialize:workerError', { message: event.data.payload.message });
           reject(new Error(event.data.payload.message));
         }
       };
@@ -269,6 +313,14 @@ export function usePyodideWorker() {
 
     const requestId = crypto.randomUUID();
     const timeoutMs = options?.timeoutMs ?? 120_000;
+
+    log.debug('pyodide:execute:posted', {
+      requestId,
+      mode: options?.mode ?? 'python',
+      codeChars: code.length,
+      timeoutMs,
+      resetShellSession: options?.resetShellSession,
+    });
 
     if (options?.onStream) {
       streamByRequestRef.current.set(requestId, options.onStream);
@@ -297,6 +349,7 @@ export function usePyodideWorker() {
   }, []);
 
   const terminate = useCallback(() => {
+    log.info('pyodide:terminate:requested');
     if (workerRef.current) {
       workerRef.current.postMessage({ type: 'TERMINATE' } as WorkerCommand);
       setTimeout(() => {

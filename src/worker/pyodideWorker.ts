@@ -4,10 +4,14 @@
 import '../renderer/polyfills/promiseTry';
 
 import type { WorkerCommand, WorkerExecuteCommand, WorkerResponse } from '../types/worker';
+import { createBridgeLogger, summarizeHostArgs } from '../shared/bridgeLogger';
 import { PRELOAD_PYODIDE_PACKAGES, PRELOAD_PYPI_PACKAGES } from './preloadPackages';
 
 import laikaShellSource from './python/laika_shell.py?raw';
 import laikaFsSource from './python/laika_fs.py?raw';
+
+/** 分级：`VITE_LAIKA_BRIDGE_LOG_LEVEL`；详见 `createBridgeLogger`。 */
+const log = createBridgeLogger('pyodideWorker');
 
 const PYODIDE_VERSION = '0.25.1';
 const PYODIDE_CDN = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -27,12 +31,15 @@ let currentRequestId = '';
 const stdoutBuffer: string[] = [];
 const stderrBuffer: string[] = [];
 
+/** 发往渲染进程的宿主 RPC：须与 `HOST_RESPONSE` 配对；含 IO / 网络 / 浏览器自动化。 */
 const pendingHost = new Map<
   string,
   {
     resolve: (value: unknown) => void;
     reject: (reason: unknown) => void;
     timer: ReturnType<typeof setTimeout>;
+    method: string;
+    startedAt: number;
   }
 >();
 
@@ -60,14 +67,36 @@ function postHostCall(method: string, args: unknown[], requestId: string): void 
   self.postMessage({ type: 'HOST_CALL', method, args, requestId });
 }
 
+/**
+ * 同步发起宿主调用（异步完成）：Python `laika_read_file` / `writeFileBase64` 等均经此处。
+ * 超时在 Worker 侧撤销；渲染进程再通过 `electronAPI` 命中主进程真实磁盘 IO。
+ */
 function hostCall<T>(method: string, args: unknown[], timeoutMs: number): Promise<T> {
   const requestId = crypto.randomUUID();
+  log.debug('hostIPC:request', {
+    method,
+    requestId,
+    timeoutMs,
+    ...summarizeHostArgs(method, args),
+  });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingHost.delete(requestId);
+      log.warn('hostIPC:timeout', {
+        method,
+        requestId,
+        timeoutMs,
+        ...summarizeHostArgs(method, args),
+      });
       reject(new Error(`${method} timed out`));
     }, timeoutMs);
-    pendingHost.set(requestId, { resolve: resolve as (v: unknown) => void, reject, timer });
+    pendingHost.set(requestId, {
+      resolve: resolve as (v: unknown) => void,
+      reject,
+      timer,
+      method,
+      startedAt: Date.now(),
+    });
     postHostCall(method, args, requestId);
   });
 }
@@ -89,6 +118,10 @@ function pyOptsToJson(opts: unknown): string {
   }
 }
 
+/**
+ * Python `from js import hostAPI`：每条链路都是 Worker → preload → main。
+ * IO 密集型：`readFile` / `readFileBase64` / `writeFile*` / `listFiles` / `statFile` / `mkdir` / `deleteFile`.
+ */
 const hostAPIBridge = {
   readFile: (path: string) => hostCall<string>('readFile', [path], 15_000),
   readFileBase64: (path: string) => hostCall<string>('readFileBase64', [path], 120_000),
@@ -115,6 +148,7 @@ const hostAPIBridge = {
     hostCall<string>('browserScreenshot', [optsJson], 180_000),
   browserEvaluate: (optsJson: string) =>
     hostCall<string>('browserEvaluate', [optsJson], 180_000),
+  browserOpenLogin: (optsJson: string) => hostCall<void>('browserOpenLogin', [optsJson], 30_000),
   /** `await hostAPI.browser.getHtml({"url": "https://..."})` — Pyodide dict → JSON. */
   browser: {
     getHtml: (opts: unknown) =>
@@ -132,17 +166,25 @@ const hostAPIBridge = {
 
 (globalThis as unknown as { hostAPI: typeof hostAPIBridge }).hostAPI = hostAPIBridge;
 
+/** PyPI wheels：触发网络抓取与本地安装，日志量较大时用 `info` 看阶段即可。 */
 async function preloadMicropipPackages(runtime: PyodideRuntime, names: readonly string[]): Promise<void> {
   if (names.length === 0) return;
+  log.info('pyodide:micropip:loadPackage');
   await runtime.loadPackage(['micropip']);
   const micropip = runtime.pyimport('micropip') as { install: (req: string) => Promise<void> };
   for (const req of names) {
+    log.debug('pyodide:micropip:install', { package: req });
     await micropip.install(req);
+    log.debug('pyodide:micropip:installed', { package: req });
   }
 }
 
 async function initializePyodide(): Promise<void> {
   try {
+    log.info('pyodide:init:start', {
+      pyodideVersion: PYODIDE_VERSION,
+      cdnPrefix: PYODIDE_CDN,
+    });
     emitMessage({
       type: 'STATUS',
       payload: { state: 'initializing', uptimeMs: Date.now() - startTime },
@@ -158,11 +200,16 @@ async function initializePyodide(): Promise<void> {
       throw new Error('Pyodide: loadPyodide not found (expected named export from pyodide.mjs)');
     }
 
+    log.debug('pyodide:loadPyodide:invoking');
+
+    /** stdout/stderr 经 `emitStdout`/`emitStderr` 回传给 UI（与结构化 log 分立）。 */
     const runtime = await loadPyodide({
       indexURL: PYODIDE_CDN,
       stdout: (t: string) => emitStdout(t),
       stderr: (t: string) => emitStderr(t),
     });
+
+    log.info('pyodide:runtime:loaded', { version: runtime.version });
 
     await runtime.runPythonAsync(`
 import json
@@ -246,25 +293,132 @@ async def laika_resolve_local_path(virtual_path: str) -> str:
 async def laika_delete_file(path: str, recursive: bool = False) -> None:
     """删除工作区内文件或目录；recursive=True 时递归删除目录。"""
     await hostAPI.deleteFile(path, recursive)
+
+
+_WAIT_UNTIL = frozenset(("load", "domcontentloaded", "networkidle"))
+_MD_MODE = frozenset(("readability", "full"))
+_MAX_MD_BYTES = 15 * 1024 * 1024
+
+
+def laika_html_to_markdown(html: str, mode: str) -> str:
+    """BeautifulSoup 截取片段 + markdownify；依赖预装 beautifulsoup4 与 micropip 的 markdownify。"""
+    from markdownify import markdownify as md_convert
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript", "template", "svg"]):
+        t.decompose()
+
+    ttl = ""
+    tg = soup.find("title")
+    if tg:
+        ttl = tg.get_text(strip=True)
+
+    root = None
+    if mode == "readability":
+        root = soup.find("article")
+        if root is None:
+            root = soup.find("main")
+        if root is None:
+            hit = soup.select_one('[role="main"]')
+            if hit:
+                root = hit
+        if root is None:
+            for cid in ("content", "main-content", "post", "article-body", "entry-content", "articleBody"):
+                hit = soup.find(id=cid)
+                if hit:
+                    root = hit
+                    break
+        if root is None:
+            root = soup.body
+    else:
+        root = soup.body if soup.body else soup
+
+    fragment = str(root) if root is not None else ""
+    md = md_convert(fragment, heading_style="ATX", bullets="-").strip()
+
+    if mode == "readability" and ttl and ttl.lower() not in ("", "document", "untitled"):
+        # 整块 Python 在 TS 模板字符串内；不要用带反斜杠的换行写法，否则会破坏 Python 源码。
+        first_line = md.splitlines()[0].strip() if md else ""
+        if not first_line.startswith("#"):
+            md = "# " + ttl + chr(10) + chr(10) + md
+
+    n = len(md.encode("utf-8"))
+    if n > _MAX_MD_BYTES:
+        raise ValueError(f"Markdown output too large ({n} bytes, max {_MAX_MD_BYTES})")
+    return md
+
+
+async def laika_browser_get_html(
+    url: str, wait_until: str = "load", timeout_ms: int = 60000
+) -> str:
+    """在隐藏 Chromium 中打开 URL（与登录窗口同分区），返回渲染后完整 HTML（含前端框架执行结果）。"""
+    w = str(wait_until)
+    if w not in _WAIT_UNTIL:
+        raise ValueError("wait_until must be load|domcontentloaded|networkidle")
+    raw = await hostAPI.browserGetHtml(
+        json.dumps({"url": url, "waitUntil": w, "timeoutMs": int(timeout_ms)})
+    )
+    return raw
+
+
+async def laika_browser_get_markdown(
+    url: str,
+    wait_until: str = "load",
+    timeout_ms: int = 60000,
+    mode: str = "readability",
+) -> str:
+    """Chromium 取渲染 HTML，再在 Python 中用 markdownify 转 Markdown。"""
+    w, m = str(wait_until), str(mode)
+    if w not in _WAIT_UNTIL:
+        raise ValueError("wait_until must be load|domcontentloaded|networkidle")
+    if m not in _MD_MODE:
+        raise ValueError("mode must be readability|full")
+    html = await laika_browser_get_html(url, wait_until=w, timeout_ms=int(timeout_ms))
+    return laika_html_to_markdown(html, m)
+
+
+async def laika_browser_evaluate(
+    url: str, script: str, wait_until: str = "load", timeout_ms: int = 60000
+):
+    """页面加载后执行 JS，返回 JSON 可序列化结果（例如自定义 DOM 抽取）。"""
+    w = str(wait_until)
+    if w not in _WAIT_UNTIL:
+        raise ValueError("wait_until must be load|domcontentloaded|networkidle")
+    raw = await hostAPI.browserEvaluate(
+        json.dumps(
+            {"url": url, "script": script, "waitUntil": w, "timeoutMs": int(timeout_ms)}
+        )
+    )
+    return json.loads(raw)
+
+
+async def laika_browser_open_login(url: str) -> None:
+    """打开可见 Chromium 窗口便于登录；Cookie 与 laika_browser_get_html 共用同一 session。"""
+    await hostAPI.browserOpenLogin(json.dumps({"url": url}))
 `);
 
     const bundled = [...PRELOAD_PYODIDE_PACKAGES];
     if (bundled.length > 0) {
+      log.info('pyodide:loadPackage:builtin', { packages: bundled });
       emitStdout(`[Laika] loadPackage: ${bundled.join(', ')}\n`);
       await runtime.loadPackage(bundled);
     }
 
     const pypiExtra = [...PRELOAD_PYPI_PACKAGES];
     if (pypiExtra.length > 0) {
+      log.info('pyodide:preload:pypi', { packages: pypiExtra });
       emitStdout(`[Laika] micropip: ${pypiExtra.join(', ')}\n`);
       await preloadMicropipPackages(runtime, pypiExtra);
     }
 
+    log.debug('python:compile:laika_shell');
     emitStdout('[Laika] compiling laika_shell.py (bashlex)\\n');
     await runtime.runPythonAsync(
       `exec(compile(${JSON.stringify(laikaShellSource)}, 'laika_shell.py', 'exec'))`
     );
 
+    log.debug('python:compile:laika_fs');
     emitStdout('[Laika] compiling laika_fs.py (posix-like workspace API)\\n');
     await runtime.runPythonAsync(`exec(compile(${JSON.stringify(laikaFsSource)}, 'laika_fs.py', 'exec'))`);
 
@@ -276,6 +430,12 @@ async def laika_delete_file(path: str, recursive: bool = False) -> None:
     isInitialized = true;
 
     const preloadedCount = bundled.length + pypiExtra.length;
+
+    log.info('pyodide:init:done', {
+      runtimeVersion: runtime.version,
+      preloadedPackageSlots: preloadedCount,
+      uptimeMs: Date.now() - startTime,
+    });
 
     emitMessage({
       type: 'INITIALIZED',
@@ -291,6 +451,11 @@ async def laika_delete_file(path: str, recursive: bool = False) -> None:
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to initialize Pyodide';
+    log.error('pyodide:init:failed', {
+      message,
+      ...(error instanceof Error ? { stack: error.stack } : {}),
+      uptimeMs: Date.now() - startTime,
+    });
     emitMessage({
       type: 'ERROR',
       payload: { message, requestId: '' },
@@ -319,6 +484,7 @@ function buildRunSource(payload: WorkerExecuteCommand['payload']): string {
 async function executePython(payload: WorkerExecuteCommand['payload'], timeoutMs: number): Promise<void> {
   const code = buildRunSource(payload);
   if (!isInitialized || !pyodide) {
+    log.warn('execute:skipped:notReady', { requestId: payload.requestId });
     emitMessage({
       type: 'ERROR',
       payload: { message: 'Pyodide not initialized', requestId: currentRequestId },
@@ -329,6 +495,14 @@ async function executePython(payload: WorkerExecuteCommand['payload'], timeoutMs
   stdoutBuffer.length = 0;
   stderrBuffer.length = 0;
   const startExec = Date.now();
+
+  log.debug('execute:start', {
+    requestId: payload.requestId,
+    mode: payload.mode ?? 'python',
+    timeoutMs,
+    codeChars: payload.code?.length ?? 0,
+    resetShellSession: Boolean(payload.resetShellSession),
+  });
 
   emitMessage({
     type: 'STATUS',
@@ -360,6 +534,15 @@ async function executePython(payload: WorkerExecuteCommand['payload'], timeoutMs
       serializedResult = String(result);
     }
 
+    log.debug('execute:success', {
+      requestId: payload.requestId,
+      executionTimeMs,
+      resultPreview:
+        serializedResult !== null && typeof serializedResult === 'object'
+          ? '[object]'
+          : String(serializedResult).slice(0, 200),
+    });
+
     emitMessage({
       type: 'RESULT',
       payload: {
@@ -373,6 +556,12 @@ async function executePython(payload: WorkerExecuteCommand['payload'], timeoutMs
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Execution error';
     const stack = error instanceof Error ? error.stack : undefined;
+    log.error('execute:failed', {
+      requestId: payload.requestId,
+      message,
+      stack,
+      executionElapsedMs: Date.now() - startExec,
+    });
     emitMessage({
       type: 'ERROR',
       payload: { message, stack, requestId: currentRequestId },
@@ -387,6 +576,7 @@ async function executePython(payload: WorkerExecuteCommand['payload'], timeoutMs
 
 async function installPackage(packageName: string): Promise<void> {
   if (!isInitialized || !pyodide) {
+    log.warn('installPackage:skipped:notReady', { packageName });
     emitMessage({
       type: 'ERROR',
       payload: { message: 'Pyodide not initialized', requestId: '' },
@@ -394,16 +584,19 @@ async function installPackage(packageName: string): Promise<void> {
     return;
   }
 
+  log.info('pyodide:installPackage:start', { packageName });
   try {
     await pyodide.loadPackage(['micropip']);
     const micropip = pyodide.pyimport('micropip') as { install: (name: string) => Promise<void> };
     await micropip.install(packageName);
+    log.info('pyodide:installPackage:done', { packageName });
     emitMessage({
       type: 'PACKAGE_INSTALLED',
       payload: { packageName, version: 'latest' },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Package install failed';
+    log.error('pyodide:installPackage:failed', { packageName, message });
     emitMessage({
       type: 'ERROR',
       payload: { message, requestId: '' },
@@ -418,13 +611,31 @@ self.onmessage = async (
 ) => {
   const msg = event.data;
 
+  // 宿主 RPC 回程：每条 `hostCall` 在这里结算；elapsed 覆盖 IPC + 磁盘/网络耗时。
   if (msg.type === 'HOST_RESPONSE') {
     const pending = pendingHost.get(msg.requestId);
-    if (pending) {
-      clearTimeout(pending.timer);
-      pendingHost.delete(msg.requestId);
-      if (msg.error) pending.reject(new Error(msg.error));
-      else pending.resolve(msg.result);
+    if (!pending) {
+      log.warn('hostIPC:orphanResponse', { requestId: msg.requestId });
+      return;
+    }
+    clearTimeout(pending.timer);
+    pendingHost.delete(msg.requestId);
+    const elapsedMs = Date.now() - pending.startedAt;
+    if (msg.error) {
+      log.debug('hostIPC:rejected', {
+        method: pending.method,
+        requestId: msg.requestId,
+        elapsedMs,
+        error: msg.error,
+      });
+      pending.reject(new Error(msg.error));
+    } else {
+      log.debug('hostIPC:fulfilled', {
+        method: pending.method,
+        requestId: msg.requestId,
+        elapsedMs,
+      });
+      pending.resolve(msg.result);
     }
     return;
   }
@@ -433,19 +644,23 @@ self.onmessage = async (
 
   switch (command.type) {
     case 'INIT':
+      log.debug('worker:message', { cmd: 'INIT' });
       await initializePyodide();
       break;
 
     case 'EXECUTE':
       currentRequestId = command.payload.requestId;
+      log.trace('worker:message', { cmd: 'EXECUTE', requestId: currentRequestId });
       await executePython(command.payload, command.payload.timeoutMs ?? 30_000);
       break;
 
     case 'INSTALL_PACKAGE':
+      log.debug('worker:message', { cmd: 'INSTALL_PACKAGE', package: command.payload.packageName });
       await installPackage(command.payload.packageName);
       break;
 
     case 'GET_STATUS':
+      log.trace('worker:message', { cmd: 'GET_STATUS' });
       emitMessage({
         type: 'STATUS',
         payload: {
@@ -457,6 +672,7 @@ self.onmessage = async (
       break;
 
     case 'TERMINATE':
+      log.info('worker:terminate');
       pyodide = null;
       isInitialized = false;
       emitMessage({
@@ -466,8 +682,11 @@ self.onmessage = async (
       self.close();
       break;
 
-    default:
+    default: {
+      const t = (command as { type?: string }).type;
+      log.warn('worker:message:unknown', { type: t });
       break;
+    }
   }
 };
 
@@ -475,3 +694,4 @@ emitMessage({
   type: 'STATUS',
   payload: { state: 'uninitialized', uptimeMs: 0 },
 });
+log.trace('worker:boot');

@@ -1,7 +1,8 @@
 """Shell execution in Pyodide: bashlex AST + Python builtins (Laika).
 
 Expects globals: laika_read_file, laika_write_file, laika_mkdir, laika_list_files,
-laika_http_request, laika_delete_file (async).
+laika_http_request, laika_delete_file,
+laika_browser_get_html, laika_browser_get_markdown, laika_browser_evaluate, laika_browser_open_login (async).
 
 bashlex: https://github.com/idank/bashlex
 """
@@ -11,15 +12,38 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Protocol
 
 import bashlex
 
 
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+MAX_CAT_BYTES = 8 * 1024 * 1024
+MAX_GREP_LINES = 50_000
+MAX_SLEEP_SECONDS = 10.0
+_BROWSER_WAIT = frozenset({"load", "domcontentloaded", "networkidle"})
 
 
-def nk(node: Any) -> str:
-    """bashlex 新版将多数 AST 节点实现为 class `node`，用 .kind 区分语义类型。"""
+# -----------------------------------------------------------------------------
+# bashlex AST helpers
+# -----------------------------------------------------------------------------
+
+
+class _AstNode(Protocol):
+    """bashlex nodes：属性随 kind 变化，仅占位便于类型排查。"""
+
+    kind: str
+    pos: tuple[int, int]
+    parts: List[Any]
+
+
+def node_kind(node: Any) -> str:
+    """提取节点的语义类型名（兼容 class `node` 与旧 Node 后缀）。"""
     k = getattr(node, "kind", None)
     if k is not None and str(k):
         return str(k)
@@ -29,17 +53,38 @@ def nk(node: Any) -> str:
     return nm.lower()
 
 
-MAX_CAT = 8 * 1024 * 1024
-MAX_GREP = 50_000
-MAX_SLEEP_S = 10.0
+# -----------------------------------------------------------------------------
+# IO & session（单例：Pyodide 内核单线程）
+# -----------------------------------------------------------------------------
 
 
-class _Ses:
-    __slots__ = ("cwd", "env", "lx")
+@dataclass
+class IO:
+    """单条命令的 stdin / stdout 语义。"""
 
-    def __init__(self) -> None:
-        self.cwd = "/"
-        self.env = {
+    stdin_text: str = ""
+    capture_stdout: bool = False
+    _chunks: List[str] = field(default_factory=list, repr=False)
+
+    def write(self, s: str = "", newline: bool = False) -> None:
+        chunk = s + ("\n" if newline else "")
+        if self.capture_stdout:
+            self._chunks.append(chunk)
+        else:
+            print(chunk, end="", flush=True)
+
+    def write_err(self, msg: str) -> None:
+        print(msg, file=sys.stderr, flush=True)
+
+    def stdout_text(self) -> str:
+        return "".join(self._chunks)
+
+
+@dataclass
+class Session:
+    cwd: str = "/"
+    env: Dict[str, str] = field(
+        default_factory=lambda: {
             "PWD": "/",
             "OLDPWD": "/",
             "HOME": "/",
@@ -47,213 +92,256 @@ class _Ses:
             "PATH": "/bin:/usr/bin",
             "LANG": "C.UTF-8",
         }
-        self.lx = 0
+    )
+    last_exit_code: int = 0
 
 
-_sess: Optional[_Ses] = None
+_session: Optional[Session] = None
 
 
-def sess() -> _Ses:
-    global _sess
-    if _sess is None:
-        _sess = _Ses()
-    return _sess
+def get_session() -> Session:
+    global _session
+    if _session is None:
+        _session = Session()
+    return _session
 
 
 async def laika_reset_shell_session() -> None:
-    global _sess
-    _sess = _Ses()
+    """由 Worker 在「重置 shell 会话」时调用；清空 cwd/env/上一退出码。"""
+    global _session
+    _session = Session()
 
 
-class IO:
-    def __init__(self, stdin_text: str = "", capture_stdout: bool = False) -> None:
-        self.inp = stdin_text or ""
-        self.cap = capture_stdout
-        self._chunks: List[str] = []
-
-    def o(self, s: str = "", nl: bool = False) -> None:
-        chunk = s + ("\n" if nl else "")
-        self._chunks.append(chunk) if self.cap else None
-        if not self.cap:
-            print(chunk, end="", flush=True)
-
-    def e(self, msg: str) -> None:
-        import sys as _sys
-
-        print(msg, file=_sys.stderr, flush=True)
-
-    def text_out(self) -> str:
-        return "".join(self._chunks)
+# -----------------------------------------------------------------------------
+# 路径：虚拟绝对路径（以 / 表示）↔ 工作区相对路径（根目录为 `.`）
+# -----------------------------------------------------------------------------
 
 
-def vrel(v: str) -> str:
-    return "." if v in ("/", ".") else v.strip("/")
+def vrel(path: str) -> str:
+    """将 resolve 后的虚路径转为 `laika_*` API 使用的相对路径（工作区根为 `.`）。"""
+    if path in ("/", ".", ""):
+        return "."
+    return path.strip("/")
 
 
-def ws_path_join(cwd: str, seg: str) -> str:
-    base = [] if cwd in ("/", ".") else [x for x in cwd.strip("/").split("/") if x]
-    for p in seg.split("/"):
-        if not p or p == ".":
+def join_path(cwd: str, segment: str) -> str:
+    """POSIX join + 规范化 `.` / `..`；cwd 为虚路径。"""
+    base: List[str] = [] if cwd in ("/", ".") else [x for x in cwd.strip("/").split("/") if x]
+    for part in segment.split("/"):
+        if not part or part == ".":
             continue
-        if p == "..":
+        if part == "..":
             if base:
                 base.pop()
         else:
-            base.append(p)
+            base.append(part)
     return "/" if not base else "/" + "/".join(base)
 
 
-async def ws_abspath(st: _Ses, p: str) -> str:
-    return ws_path_join("/", p.strip("/")) if p.startswith("/") else ws_path_join(st.cwd, p)
+async def resolve_path(st: Session, path: str) -> str:
+    """解析为虚绝对路径（保留前导 `/`）。"""
+    if path.startswith("/"):
+        return join_path("/", path)
+    return join_path(st.cwd, path)
 
 
-async def ew(w: Any, st: _Ses) -> str:
-    ps = getattr(w, "parts", None)
-    if not ps:
-        return w.word
-    b0 = w.pos[0]
-    raw, last = w.word, 0
+# -----------------------------------------------------------------------------
+# 词法展开：$VAR、$(cmd)、$?
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class PlainWord:
+    """人造 Word 节点，用于赋值 RHS 等的展开。"""
+
+    word: str
+    parts: List[Any] = field(default_factory=list)
+    pos: tuple[int, int] = field(default_factory=lambda: (0, 0))
+
+    def __post_init__(self) -> None:
+        if self.pos == (0, 0):
+            self.pos = (0, len(self.word))
+
+
+async def expand_word(word_node: Any, st: Session) -> str:
+    parts = getattr(word_node, "parts", None)
+    if not parts:
+        return str(getattr(word_node, "word", ""))
+
+    base_offset = int(word_node.pos[0])
+    raw: str = str(word_node.word)
+    last = 0
     chunks: List[str] = []
-    for p in sorted(ps, key=lambda x: x.pos[0]):
-        a, ee = p.pos
-        i0, i1 = a - b0, ee - b0
+
+    for part in sorted(parts, key=lambda x: int(x.pos[0])):
+        start, end = part.pos
+        i0, i1 = start - base_offset, end - base_offset
+
         if i0 > last:
-            i0_adj = i0
-            if nk(p) == "parameter" and str(getattr(p, "value", "")) == "?" and i0_adj > last and raw[i0_adj - 1] == "$":
-                i0_adj -= 1
-            chunks.append(raw[last:i0_adj])
-        chunks.append(await _ep(p, st))
+            adj = i0
+            if (
+                node_kind(part) == "parameter"
+                and str(getattr(part, "value", "")) == "?"
+                and adj > last
+                and raw[adj - 1] == "$"
+            ):
+                adj -= 1
+            chunks.append(raw[last:adj])
+
+        chunks.append(await _expand_part(part, st))
         last = i1
+
     if last < len(raw):
         chunks.append(raw[last:])
+
     return "".join(chunks)
 
 
-async def _ep(p: Any, st: _Ses) -> str:
-    t = nk(p)
-    if t == "parameter":
-        pv = getattr(p, "value", None)
-        if str(pv) == "?":
-            return str(st.lx)
-        return str(st.env.get(str(pv), ""))
-    if t == "commandsubstitution":
-        io = IO("", True)
-        await run_ast(p.command, st, io)
-        return io.text_out().rstrip("\n")
+async def _expand_part(part: Any, st: Session) -> str:
+    kind = node_kind(part)
+    if kind == "parameter":
+        value = getattr(part, "value", None)
+        if str(value) == "?":
+            return str(st.last_exit_code)
+        return str(st.env.get(str(value), ""))
+    if kind == "commandsubstitution":
+        sub_io = IO("", capture_stdout=True)
+        await run_ast(part.command, st, sub_io)
+        return sub_io.stdout_text().rstrip("\n")
     return ""
 
 
-class PlainW:
-    __slots__ = ("word", "parts", "pos")
-
-    def __init__(self, t: str) -> None:
-        self.word = t
-        self.parts: List[Any] = []
-        self.pos = (0, len(t))
-
-
-async def asn_env(nodes: List[Any], st: _Ses) -> Dict[str, str]:
-    m = dict(st.env)
-    for a in nodes:
-        eq = str(a.word).find("=")
-        if eq < 1:
+async def eval_assignments(nodes: List[Any], st: Session) -> Dict[str, str]:
+    """赋值节点 → 新环境副本（外层负责在 finally 恢复原 env）。"""
+    new_env = dict(st.env)
+    for node in nodes:
+        text = str(getattr(node, "word", ""))
+        if "=" not in text:
             continue
-        k, rhs = str(a.word)[:eq], str(a.word)[eq + 1 :]
-        br = _Ses()
-        br.cwd, br.env, br.lx = st.cwd, m, st.lx
-        m[k] = await ew(PlainW(rhs), br)
-    return m
+        key, rhs = text.split("=", 1)
+        tmp = Session(cwd=st.cwd, env=new_env, last_exit_code=st.last_exit_code)
+        new_env[key] = await expand_word(PlainWord(rhs), tmp)
+    return new_env
 
 
-async def words(ws: List[Any], st: _Ses) -> List[str]:
-    return [await ew(x, st) for x in ws]
+async def expand_words(nodes: List[Any], st: Session) -> List[str]:
+    return [await expand_word(n, st) for n in nodes]
 
 
-async def run_ast(node: Any, st: _Ses, io: IO, loc: Optional[Dict[str, str]] = None) -> int:
-    k = nk(node)
-    if k == "command":
-        wr, reds, asn = [], [], []
-        try:
-            for p in node.parts:
-                qt = nk(p)
-                if qt == "redirect":
-                    reds.append(p)
-                elif qt == "word":
-                    wr.append(p)
-                elif qt == "assignment":
-                    asn.append(p)
-                elif qt == "compound":
-                    raise ValueError("nested compound unsupported")
-                else:
-                    raise ValueError(qt)
-        except ValueError as ex:
-            io.e(f"parse: {ex}")
-            st.lx = 2
-            return 2
-        bk = dict(st.env)
-        try:
-            if asn:
-                st.env = await asn_env(asn, st)
-            if loc:
-                st.env.update(loc)
-            stdin = io.inp or ""
-            out_path, out_app = None, False
-            for rd in reds:
-                typ = rd.type
-                pt = getattr(rd, "output", None)
-                ph = await ew(pt, st) if pt else ""
-                if typ == "<":
-                    stdin = await laika_read_file(vrel(await ws_abspath(st, ph)))
-                elif typ == ">":
-                    out_path, out_app = ph, False
-                elif typ == ">>":
-                    out_path, out_app = ph, True
-            sub_io = IO(stdin, io.cap or (out_path is not None))
-            argv = await words(wr, st)
-            if not argv:
-                st.lx = 0
-                if out_path:
-                    await wfile(st, "", out_path, out_app)
-                return 0
-            ex = await dispatch(argv[0], argv, st, sub_io)
-            txt = sub_io.text_out()
-            if out_path:
-                await wfile(st, txt, out_path, out_app)
-            elif io.cap:
-                io.o(txt)
-            st.lx = ex
-            return ex
-        finally:
-            if asn:
-                st.env = bk
-    if k == "list":
-        return await list_run(node.parts, st, io)
-    if k == "pipeline":
-        return await pipe_run(node, st)
-    if k == "compound" and node.list and nk(node.list[0]) == "if":
-        return await if_run(node.list[0], st, io)
-    io.e(f"unsupported: {k}")
-    st.lx = 2
+# -----------------------------------------------------------------------------
+# AST 执行
+# -----------------------------------------------------------------------------
+
+
+async def run_ast(
+    node: Any,
+    st: Session,
+    io: IO,
+    local_env: Optional[Dict[str, str]] = None,
+) -> int:
+    kind = node_kind(node)
+
+    if kind == "command":
+        return await _run_command(node, st, io, local_env)
+    if kind == "list":
+        return await _run_list(node.parts, st, io)
+    if kind == "pipeline":
+        return await _run_pipeline(node, st, io)
+    if kind == "compound" and node.list and node_kind(node.list[0]) == "if":
+        return await _run_if(node.list[0], st, io)
+
+    io.write_err(f"unsupported: {kind}")
+    st.last_exit_code = 2
     return 2
 
 
-async def wfile(st: _Ses, text: str, path: str, append: bool) -> None:
-    rel = vrel(await ws_abspath(st, path))
-    old = ""
+async def _run_command(
+    node: Any,
+    st: Session,
+    io: IO,
+    local_env: Optional[Dict[str, str]] = None,
+) -> int:
+    words: List[Any] = []
+    redirects: List[Any] = []
+    assignments: List[Any] = []
+
     try:
-        old = await laika_read_file(rel)
-    except Exception:
-        pass
-    await laika_write_file(rel, old + text if append else text)
+        for part in node.parts:
+            pt = node_kind(part)
+            if pt == "redirect":
+                redirects.append(part)
+            elif pt == "word":
+                words.append(part)
+            elif pt == "assignment":
+                assignments.append(part)
+            elif pt == "compound":
+                raise ValueError("nested compound unsupported")
+            else:
+                raise ValueError(f"unknown part type: {pt}")
+    except ValueError as exc:
+        io.write_err(f"parse: {exc}")
+        st.last_exit_code = 2
+        return 2
+
+    original_env = st.env
+    try:
+        if assignments:
+            st.env = await eval_assignments(assignments, st)
+        if local_env:
+            st.env.update(local_env)
+
+        stdin_text = io.stdin_text or ""
+        out_path: Optional[str] = None
+        out_append = False
+
+        for rd in redirects:
+            rd_type = rd.type
+            target_node = getattr(rd, "output", None)
+            target_path = await expand_word(target_node, st) if target_node else ""
+
+            if rd_type == "<":
+                stdin_text = await _read_file_or_empty(vrel(await resolve_path(st, target_path)))
+            elif rd_type == ">":
+                out_path, out_append = target_path, False
+            elif rd_type == ">>":
+                out_path, out_append = target_path, True
+
+        sub_io = IO(stdin_text, io.capture_stdout or (out_path is not None))
+        argv = await expand_words(words, st)
+
+        if not argv:
+            st.last_exit_code = 0
+            if out_path:
+                await _write_file(st, "", out_path, out_append)
+            return 0
+
+        exit_code = await dispatch(argv[0], argv, st, sub_io)
+        output_text = sub_io.stdout_text()
+
+        if out_path:
+            await _write_file(st, output_text, out_path, out_append)
+        elif io.capture_stdout:
+            io.write(output_text)
+
+        st.last_exit_code = exit_code
+        return exit_code
+
+    finally:
+        if assignments:
+            st.env = original_env
 
 
-async def list_run(parts: List[Any], st: _Ses, io: IO) -> int:
-    i, skip, acc = 0, False, st.lx
+async def _run_list(parts: List[Any], st: Session, io: IO) -> int:
+    acc = 0
+    skip = False
+
+    i = 0
     while i < len(parts):
-        el = parts[i]
+        element = parts[i]
         i += 1
-        if nk(el) == "operator":
-            op = el.op
+
+        if node_kind(element) == "operator":
+            op = element.op
             if op == ";":
                 skip = False
             elif op == "&&":
@@ -261,501 +349,848 @@ async def list_run(parts: List[Any], st: _Ses, io: IO) -> int:
             elif op == "||":
                 skip = acc == 0
             else:
-                io.e(f"operator {op} unsupported")
-                acc = st.lx = 2
+                io.write_err(f"operator {op} unsupported")
+                acc = st.last_exit_code = 2
             continue
+
         if not skip:
-            acc = await run_ast(el, st, io)
-    st.lx = acc
+            acc = await run_ast(element, st, io)
+
+    st.last_exit_code = acc
     return acc
 
 
-async def pipe_run(pn: Any, st: _Ses) -> int:
-    cmds = [x for x in pn.parts if nk(x) == "command"]
+async def _run_pipeline(node: Any, st: Session, io: IO) -> int:
+    """管道：首段读 `io.stdin_text`，后续段读上一段 stdout。"""
+    cmds = [x for x in node.parts if node_kind(x) == "command"]
     if not cmds:
+        st.last_exit_code = 2
         return 2
-    data = ""
-    for j, cc in enumerate(cmds):
-        last = j == len(cmds) - 1
-        sub = IO(data if j else "", not last)
-        ex = await run_ast(cc, st, sub)
-        if last:
-            st.lx = ex
-            return ex
-        data = sub.text_out()
-    return st.lx
+
+    pipe_data = ""
+
+    for idx, cmd in enumerate(cmds):
+        is_last = idx == len(cmds) - 1
+        capture = not is_last or io.capture_stdout
+        stdin_in = io.stdin_text if idx == 0 else pipe_data
+        sub_io = IO(stdin_in, capture)
+        exit_code = await run_ast(cmd, st, sub_io)
+
+        if is_last:
+            if io.capture_stdout:
+                io.write(sub_io.stdout_text())
+            st.last_exit_code = exit_code
+            return exit_code
+
+        pipe_data = sub_io.stdout_text()
+
+    st.last_exit_code = 2
+    return 2
 
 
-async def if_run(fn: Any, st: _Ses, io: IO) -> int:
-    pp = fn.parts
-    if len(pp) < 4 or getattr(pp[0], "word", "") != "if" or getattr(pp[2], "word", "") != "then":
-        io.e("if: malformed")
+async def _run_if(node: Any, st: Session, io: IO) -> int:
+    """if-then；无 else/elif。条件命令的退出码决定是否执行 then 分支。"""
+    parts = node.parts
+
+    if_idx = next((i for i, p in enumerate(parts) if getattr(p, "word", "") == "if"), -1)
+    then_idx = next((i for i, p in enumerate(parts) if getattr(p, "word", "") == "then"), -1)
+
+    if if_idx < 0 or then_idx < 0 or then_idx <= if_idx + 1:
+        io.write_err("if: malformed")
+        st.last_exit_code = 2
         return 2
-    cond, bod = pp[1], pp[3]
-    c = await list_run(cond.parts, st, IO(io.inp, io.cap))
-    if c != 0:
-        # Bash: failed condition means the `if` construct still exits 0 (branch skipped).
-        st.lx = 0
+
+    cond_node = parts[if_idx + 1]
+    body_node = parts[then_idx + 1]
+
+    # 与 bash 一致：条件命令的 stdout 应可见，除非整条被包在命令替换里（由 io.capture_stdout 表达）
+    cond_io = IO(io.stdin_text, io.capture_stdout)
+    cond_exit = await _run_list(cond_node.parts, st, cond_io)
+
+    if cond_exit != 0:
+        st.last_exit_code = 0
         return 0
-    b = await list_run(bod.parts, st, io)
-    st.lx = b
-    return b
+
+    body_exit = await _run_list(body_node.parts, st, io)
+    st.last_exit_code = body_exit
+    return body_exit
 
 
-async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
-    async def lf(rel: str) -> List[Dict]:
-        xs = await laika_list_files(rel)
-        return xs.to_py() if hasattr(xs, "to_py") else list(xs)
+# -----------------------------------------------------------------------------
+# 命令注册表
+# -----------------------------------------------------------------------------
 
-    async def chkdir(pv: str) -> bool:
+CommandHandler = Callable[[List[str], Session, IO], Coroutine[Any, Any, int]]
+_COMMAND_REGISTRY: Dict[str, CommandHandler] = {}
+
+
+def register_command(name: str) -> Callable[[CommandHandler], CommandHandler]:
+    def decorator(fn: CommandHandler) -> CommandHandler:
+        _COMMAND_REGISTRY[name] = fn
+        return fn
+
+    return decorator
+
+
+async def dispatch(cmd: str, argv: List[str], st: Session, io: IO) -> int:
+    handler = _COMMAND_REGISTRY.get(cmd)
+    if handler:
+        return await handler(argv, st, io)
+    return 127
+
+
+# -----------------------------------------------------------------------------
+# 文件与列表辅助
+# -----------------------------------------------------------------------------
+
+
+async def _read_file_or_empty(rel: str) -> str:
+    try:
+        content = await laika_read_file(rel)
+        return content[:MAX_CAT_BYTES]
+    except Exception:
+        return ""
+
+
+async def _write_file(st: Session, text: str, path: str, append: bool) -> None:
+    rel = vrel(await resolve_path(st, path))
+    old = ""
+    if append:
         try:
-            await lf(vrel(pv))
+            old = await laika_read_file(rel)
+        except Exception:
+            pass
+    await laika_write_file(rel, old + text if append else text)
+
+
+async def _list_files(rel: str) -> List[Dict[str, Any]]:
+    xs = await laika_list_files(rel)
+    return xs.to_py() if hasattr(xs, "to_py") else list(xs)
+
+
+async def _is_directory(st: Session, path: str) -> bool:
+    """能列出子项则视为目录（与旧实现及 MemFS 行为一致）。"""
+    try:
+        await _list_files(vrel(await resolve_path(st, path)))
+        return True
+    except Exception:
+        return False
+
+
+def sh_quote(value: str) -> str:
+    if re.match(r"^[\w@%+=:,./-]+$", value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+# -----------------------------------------------------------------------------
+# 内建命令
+# -----------------------------------------------------------------------------
+
+
+@register_command("help")
+async def cmd_help(argv: List[str], st: Session, io: IO) -> int:
+    io.write(
+        "Laika bash (bashlex): cd pwd ls mkdir touch mv cp rm cat head tail wc grep awk sed curl echo export env sleep;",
+        newline=True,
+    )
+    io.write(
+        "Chromium fetch: browser-html URL [--wait load|domcontentloaded|networkidle];",
+        newline=True,
+    )
+    io.write(
+        "  browser-md URL [--full] [--wait …] (Markdown via markdownify); browser-login URL;",
+        newline=True,
+    )
+    io.write("; && || | < > >> $(…) assignments.", newline=True)
+    return 0
+
+
+@register_command("true")
+async def cmd_true(argv: List[str], st: Session, io: IO) -> int:
+    return 0
+
+
+@register_command("clear")
+async def cmd_clear(argv: List[str], st: Session, io: IO) -> int:
+    return 0
+
+
+@register_command("false")
+async def cmd_false(argv: List[str], st: Session, io: IO) -> int:
+    return 1
+
+
+@register_command("sleep")
+async def cmd_sleep(argv: List[str], st: Session, io: IO) -> int:
+    try:
+        sec = float(argv[1]) if len(argv) > 1 else 0.0
+    except ValueError:
+        io.write_err("sleep: invalid time interval")
+        return 1
+    await asyncio.sleep(min(MAX_SLEEP_SECONDS, max(sec, 0.0)))
+    return 0 if sec >= 0 else 1
+
+
+@register_command("export")
+async def cmd_export(argv: List[str], st: Session, io: IO) -> int:
+    if len(argv) == 1:
+        for key in sorted(st.env.keys()):
+            io.write(f"export {key}={sh_quote(st.env[key])}", newline=True)
+        return 0
+
+    for token in argv[1:]:
+        if "=" not in token:
+            st.env.setdefault(token, "")
+        else:
+            idx = token.index("=")
+            st.env[token[:idx]] = token[idx + 1 :]
+    return 0
+
+
+@register_command("unset")
+async def cmd_unset(argv: List[str], st: Session, io: IO) -> int:
+    for key in argv[1:]:
+        st.env.pop(key, None)
+    return 0
+
+
+@register_command("pwd")
+async def cmd_pwd(argv: List[str], st: Session, io: IO) -> int:
+    io.write(st.cwd if st.cwd != "/" else "/", newline=True)
+    return 0
+
+
+@register_command("cd")
+async def cmd_cd(argv: List[str], st: Session, io: IO) -> int:
+    target = argv[1] if len(argv) > 1 else st.env.get("HOME", "/")
+    if target == "-":
+        target = st.env.get("OLDPWD", "/")
+
+    new_path = await resolve_path(st, target)
+    if not await _is_directory(st, new_path):
+        io.write_err(f"cd: {target}: no such dir")
+        return 1
+
+    st.env["OLDPWD"] = st.cwd
+    st.cwd = new_path
+    st.env["PWD"] = st.cwd
+    return 0
+
+
+@register_command("env")
+async def cmd_env(argv: List[str], st: Session, io: IO) -> int:
+    for key in sorted(st.env.keys()):
+        io.write(f"{key}={st.env[key]}", newline=True)
+    return 0
+
+
+@register_command("printenv")
+async def cmd_printenv(argv: List[str], st: Session, io: IO) -> int:
+    if len(argv) > 1:
+        value = st.env.get(argv[1])
+        if value is None:
+            io.write_err("not set")
+            return 1
+        io.write(value, newline=True)
+        return 0
+    return await cmd_env(argv, st, io)
+
+
+@register_command("echo")
+async def cmd_echo(argv: List[str], st: Session, io: IO) -> int:
+    idx = 1
+    newline = True
+    if len(argv) > idx and argv[idx] == "-n":
+        idx += 1
+        newline = False
+    io.write(" ".join(argv[idx:]), newline=newline)
+    return 0
+
+
+@register_command("ls")
+async def cmd_ls(argv: List[str], st: Session, io: IO) -> int:
+    show_all = long_format = False
+    paths: List[str] = []
+
+    for arg in argv[1:]:
+        if arg.startswith("-") and len(arg) > 1:
+            show_all = show_all or ("a" in arg[1:])
+            long_format = long_format or ("l" in arg[1:])
+        else:
+            paths.append(arg)
+
+    if not paths:
+        paths = ["."]
+
+    exit_code = 0
+    for path in paths:
+        rel = vrel(await resolve_path(st, path))
+        try:
+            rows = await _list_files(rel)
+        except Exception as exc:
+            exit_code = 1
+            io.write_err(f"ls: {path}: {exc}")
+            continue
+
+        rows = sorted(rows, key=lambda r: str(r.get("name", "")))
+        if not show_all:
+            rows = [r for r in rows if not str(r.get("name", "")).startswith(".")]
+
+        if len(paths) > 1:
+            io.write(f"{path}:", newline=True)
+
+        for row in rows:
+            name = str(row.get("name", ""))
+            is_dir = row.get("isDirectory", False)
+            suffix = "/" if is_dir else ""
+            if long_format:
+                size = row.get("size", 0)
+                mtime = row.get("modified", 0)
+                io.write(f"{size}\t{mtime}\t{name}{suffix}", newline=True)
+            else:
+                io.write(f"{name}{suffix}", newline=True)
+
+    return exit_code
+
+
+@register_command("cat")
+async def cmd_cat(argv: List[str], st: Session, io: IO) -> int:
+    if len(argv) == 1:
+        io.write(io.stdin_text)
+        return 0
+
+    async def read_one(path: str) -> tuple[str, str]:
+        try:
+            rel = vrel(await resolve_path(st, path))
+            content = await laika_read_file(rel)
+            return (path, content[:MAX_CAT_BYTES])
+        except Exception as exc:
+            return (path, f"__ERROR__:{exc}")
+
+    results = await asyncio.gather(*(read_one(f) for f in argv[1:]))
+    exit_code = 0
+    for path, content in results:
+        if content.startswith("__ERROR__:"):
+            exit_code = 1
+            io.write_err(f"cat: {path}")
+        else:
+            io.write(content)
+    return exit_code
+
+
+@register_command("head")
+async def cmd_head(argv: List[str], st: Session, io: IO) -> int:
+    n, idx = 10, 1
+    if len(argv) > idx and argv[idx] == "-n" and len(argv) > idx + 1:
+        try:
+            n = int(argv[idx + 1])
+        except ValueError:
+            io.write_err("head: invalid line count")
+            return 1
+        idx += 2
+
+    filename = argv[idx] if len(argv) > idx else None
+    data = io.stdin_text if filename is None else await _read_file_or_empty(
+        vrel(await resolve_path(st, filename))
+    )
+    lines = data.split("\n")
+    out = "\n".join(lines[:n]) + ("\n" if lines else "")
+    io.write(out)
+    return 0
+
+
+@register_command("tail")
+async def cmd_tail(argv: List[str], st: Session, io: IO) -> int:
+    n, idx = 10, 1
+    if len(argv) > idx and argv[idx] == "-n" and len(argv) > idx + 1:
+        try:
+            n = int(argv[idx + 1])
+        except ValueError:
+            io.write_err("tail: invalid line count")
+            return 1
+        idx += 2
+
+    filename = argv[idx] if len(argv) > idx else None
+    data = io.stdin_text if filename is None else await _read_file_or_empty(
+        vrel(await resolve_path(st, filename))
+    )
+    lines = data.split("\n")
+    body = lines[:-1] if lines and lines[-1] == "" else lines
+    out = "\n".join(body[-n:]) + ("\n" if body else "")
+    io.write(out)
+    return 0
+
+
+@register_command("mkdir")
+async def cmd_mkdir(argv: List[str], st: Session, io: IO) -> int:
+    exit_code = 0
+    for path in argv[1:]:
+        if path == "-p":
+            continue
+        try:
+            await laika_mkdir(vrel(await resolve_path(st, path)))
+        except Exception as exc:
+            io.write_err(f"mkdir: {path}: {exc}")
+            exit_code = 1
+    return exit_code
+
+
+@register_command("touch")
+async def cmd_touch(argv: List[str], st: Session, io: IO) -> int:
+    exit_code = 0
+    for path in argv[1:]:
+        rel = vrel(await resolve_path(st, path))
+        try:
+            await laika_read_file(rel)
+        except Exception:
+            try:
+                await laika_write_file(rel, "")
+            except Exception as exc:
+                io.write_err(f"touch: {path}: {exc}")
+                exit_code = 1
+    return exit_code
+
+
+@register_command("mv")
+async def cmd_mv(argv: List[str], st: Session, io: IO) -> int:
+    if len(argv) < 3:
+        io.write_err("mv: missing operand")
+        return 1
+
+    src_rel = vrel(await resolve_path(st, argv[1]))
+    dst_rel = vrel(await resolve_path(st, argv[2]))
+
+    try:
+        body = await laika_read_file(src_rel)
+    except Exception:
+        io.write_err(f"mv: cannot stat '{argv[1]}'")
+        return 1
+
+    dest = dst_rel
+    try:
+        await _list_files(dst_rel)
+        base = argv[1].rstrip("/").split("/")[-1]
+        dest = vrel(await resolve_path(st, argv[2].rstrip("/") + "/" + base))
+    except Exception:
+        pass
+
+    try:
+        await laika_write_file(dest, body)
+        await laika_delete_file(src_rel, False)
+    except Exception as exc:
+        io.write_err(f"mv: {exc}")
+        return 1
+    return 0
+
+
+@register_command("cp")
+async def cmd_cp(argv: List[str], st: Session, io: IO) -> int:
+    if len(argv) < 3:
+        io.write_err("cp: missing operand")
+        return 1
+
+    recursive = "-r" in argv or "-R" in argv
+    args = [a for a in argv[1:] if a not in ("-r", "-R")]
+    dst = vrel(await resolve_path(st, args[-1]))
+
+    dst_is_dir = False
+    try:
+        await _list_files(dst)
+        dst_is_dir = True
+    except Exception:
+        pass
+
+    if len(args) > 2 and not dst_is_dir:
+        io.write_err("cp: target is not a directory")
+        return 1
+
+    exit_code = 0
+
+    async def _copy_recursive(src_path: str, dst_path: str) -> bool:
+        try:
+            body = await laika_read_file(src_path)
+            await laika_write_file(dst_path, body)
             return True
+        except Exception:
+            pass
+
+        try:
+            entries = await _list_files(src_path)
         except Exception:
             return False
 
-    if cmd == "help":
-        io.o(
-            "Laika bash (bashlex→Python): cd pwd ls mkdir touch mv cp rm cat head tail wc grep awk sed curl echo export env sleep;",
-            nl=True,
-        )
-        io.o("; && || | < > >> $(…) assignments; unsupported nodes error.", nl=True)
-        return 0
-    if cmd in ("true", "clear"):
-        return 0
-    if cmd == "false":
-        return 1
-    if cmd == "sleep":
-        sec = float(argv[1]) if len(argv) > 1 else 0
-        await asyncio.sleep(min(MAX_SLEEP_S, max(sec, 0)))
-        return 0 if sec >= 0 else 1
-
-    if cmd == "export":
-        if len(argv) == 1:
-            for k in sorted(st.env.keys()):
-                io.o(f'export {k}={sh_quote(st.env[k])}', nl=True)
-            return 0
-        for w in argv[1:]:
-            if "=" not in w:
-                st.env.setdefault(w, "")
-            else:
-                j = w.index("=")
-                st.env[w[:j]] = w[j + 1 :]
-        return 0
-    if cmd == "unset":
-        for k in argv[1:]:
-            st.env.pop(k, None)
-        return 0
-    if cmd == "pwd":
-        io.o("/", nl=True) if st.cwd == "/" else io.o(st.cwd, nl=True)
-        return 0
-    if cmd == "cd":
-        tg = argv[1] if len(argv) > 1 else st.env.get("HOME", "/")
-        nx = st.env.get("OLDPWD", "/") if tg == "-" else ws_path_join(st.cwd, tg)
-        if not await chkdir(nx):
-            io.e(f"cd: {tg}: no such dir")
-            return 1
-        st.env["OLDPWD"] = st.cwd
-        st.cwd = nx
-        st.env["PWD"] = st.cwd
-        return 0
-    if cmd == "env" or cmd == "printenv":
-        if cmd == "printenv" and len(argv) > 1:
-            v = st.env.get(argv[1])
-            if v is None:
-                io.e("not set")
-                return 1
-            io.o(v, nl=True)
-            return 0
-        for k in sorted(st.env.keys()):
-            io.o(f"{k}={st.env[k]}", nl=True)
-        return 0
-    if cmd == "echo":
-        i = 1
-        if len(argv) > i and argv[i] == "-n":
-            i += 1
-            io.o(" ".join(argv[i:]))
-            return 0
-        io.o(" ".join(argv[i:]), nl=True)
-        return 0
-
-    if cmd == "ls":
-        showa = longg = False
-        ps: List[str] = []
-        for a in argv[1:]:
-            if a.startswith("-") and len(a) > 1:
-                showa = showa or ("a" in a[1:])
-                longg = longg or ("l" in a[1:])
-            else:
-                ps.append(a)
-        if not ps:
-            ps = ["."]
-        ex = 0
-        for p in ps:
-            rel = vrel(await ws_abspath(st, p))
-            try:
-                rows = await lf(rel)
-            except Exception:
-                ex = 1
-                io.e(f"ls: {p}")
+        await laika_mkdir(dst_path)
+        for entry in entries:
+            name = str(entry.get("name", ""))
+            if name in (".", ".."):
                 continue
-            rows = sorted(rows, key=lambda r: r["name"])
-            rows = rows if showa else [r for r in rows if not str(r["name"]).startswith(".")]
-            if len(ps) > 1:
-                io.o(f"{p}:", nl=True)
-            for r in rows:
-                d = "/" if r.get("isDirectory") else ""
-                if longg:
-                    io.o(f"{r.get('size',0)}\t{r.get('modified',0)}\t{r['name']}{d}", nl=True)
-                else:
-                    io.o(f"{r['name']}{d}", nl=True)
-        return ex
+            child_src = (src_path + "/" + name).strip("/")
+            child_dst = (dst_path + "/" + name).strip("/")
+            if not await _copy_recursive(child_src, child_dst):
+                return False
+        return True
 
-    async def rf(rel: str) -> str:
-        s = await laika_read_file(rel)
-        return s[:MAX_CAT]
+    for src in args[:-1]:
+        src_rel = vrel(await resolve_path(st, src))
+        target = dst
+        if dst_is_dir or len(args) > 2:
+            target = (dst + "/" + src.split("/")[-1]).strip("/")
 
-    if cmd == "cat":
-        if len(argv) == 1:
-            io.o(io.inp)
-            return 0
-        ex = 0
-        for f in argv[1:]:
-            try:
-                io.o(await rf(vrel(await ws_abspath(st, f))))
-            except Exception:
-                ex = 1
-                io.e(f"cat: {f}")
-        return ex
+        try:
+            body = await laika_read_file(src_rel)
+            await laika_write_file(target, body)
+        except Exception:
+            if recursive:
+                if not await _copy_recursive(src_rel, target):
+                    exit_code = 1
+                    io.write_err(f"cp: cannot copy {src}")
+            else:
+                exit_code = 1
+                io.write_err(f"cp: dir needs -r: {src}")
 
-    if cmd in ("head", "tail"):
-        n = 10
-        i = 1
-        if len(argv) > i and argv[i] == "-n" and len(argv) > i + 1:
-            n = int(argv[i + 1])
-            i += 2
-        fn = argv[i] if len(argv) > i else None
-        data = io.inp if fn is None else await rf(vrel(await ws_abspath(st, fn)))
-        lines = data.split("\n")
-        if cmd == "head":
-            out = "\n".join(lines[:n]) + ("\n" if lines else "")
-        else:
-            body = lines[:-1] if lines and lines[-1] == "" else lines
-            out = "\n".join(body[-n:]) + ("\n" if body else "")
-        io.o(out)
-        return 0
+    return exit_code
 
-    if cmd == "mkdir":
-        ex = 0
-        for p in argv[1:]:
-            if p == "-p":
+
+@register_command("rm")
+async def cmd_rm(argv: List[str], st: Session, io: IO) -> int:
+    recursive = any(x in argv for x in ("-r", "-R", "-rf", "-fr"))
+    skip = {"-r", "-R", "-f", "-rf", "-fr"}
+    paths = [a for a in argv[1:] if a not in skip and not a.startswith("-")]
+
+    exit_code = 0
+    for path in paths:
+        rel = vrel(await resolve_path(st, path))
+        try:
+            await laika_delete_file(rel, recursive)
+        except Exception as exc:
+            exit_code = 1
+            io.write_err(f"rm: {path}: {exc}")
+    return exit_code
+
+
+@register_command("rmdir")
+async def cmd_rmdir(argv: List[str], st: Session, io: IO) -> int:
+    exit_code = 0
+    for path in argv[1:]:
+        rel = vrel(await resolve_path(st, path))
+        try:
+            entries = await _list_files(rel)
+            if entries:
+                io.write_err(f"rmdir: not empty {path}")
+                exit_code = 1
                 continue
-            try:
-                await laika_mkdir(vrel(await ws_abspath(st, p)))
-            except Exception:
-                ex = 1
-        return ex
-
-    if cmd == "touch":
-        ex = 0
-        for p in argv[1:]:
-            rel = vrel(await ws_abspath(st, p))
-            try:
-                await rf(rel)
-            except Exception:
-                try:
-                    await laika_write_file(rel, "")
-                except Exception:
-                    ex = 1
-        return ex
-
-    if cmd == "mv":
-        if len(argv) < 3:
-            return 1
-        srel = vrel(await ws_abspath(st, argv[1]))
-        drel = vrel(await ws_abspath(st, argv[2]))
-        try:
-            body = await laika_read_file(srel)
-        except Exception:
-            io.e("mv: missing file")
-            return 1
-        dest = drel
-        try:
-            await laika_list_files(drel)
-            base = argv[1].rstrip("/").split("/")[-1]
-            dest = vrel(await ws_abspath(st, argv[2].rstrip("/") + "/" + base))
-        except Exception:
-            pass
-        try:
-            await laika_write_file(dest, body)
-            await laika_delete_file(srel, False)
-        except Exception:
-            return 1
-        return 0
-
-    if cmd == "cp":
-        if len(argv) < 3:
-            return 1
-        rec = "-r" in argv or "-R" in argv
-        xs = [a for a in argv[1:] if a not in ("-r", "-R")]
-        dst = vrel(await ws_abspath(st, xs[-1]))
-        ex = 0
-        try:
-            await lf(dst)
-            d_isdir = True
-        except Exception:
-            d_isdir = False
-        for s in xs[:-1]:
-            srel = vrel(await ws_abspath(st, s))
-            try:
-                body = await laika_read_file(srel)
-                target = dst
-                if d_isdir or len(xs) > 2:
-                    target = dst + "/" + s.split("/")[-1]
-                await laika_write_file(target, body)
-            except Exception:
-                if not rec:
-                    ex = 1
-                    io.e(f"cp: dir needs -r: {s}")
-                else:
-                    ex = 1
-        return ex
-
-    if cmd == "rm":
-        rf_ = any(x in argv for x in ("-r", "-R", "-rf", "-fr"))
-        xs = [a for a in argv[1:] if a not in ("-r", "-R", "-f", "-rf", "-fr") and not a.startswith("-")]
-        ex = 0
-        for p in xs:
-            rel = vrel(await ws_abspath(st, p))
-            try:
-                await laika_delete_file(rel, rf_)
-            except Exception:
-                ex = 1
-                io.e(f"rm: {p}")
-        return ex
-
-    if cmd == "rmdir":
-        ex = 0
-        for p in argv[1:]:
-            rel = vrel(await ws_abspath(st, p))
-            try:
-                if await lf(rel):
-                    io.e(f"rmdir: not empty {p}")
-                    ex = 1
-                    continue
-                await laika_delete_file(rel)
-            except Exception:
-                ex = 1
-        return ex
-
-    if cmd == "wc":
-        modes = "-l" in argv
-        fs = [a for a in argv[1:] if not a.startswith("-")]
-        total = 0
-        ex = 0
-        if not fs:
-            data = io.inp
-            n = _count_lines(data)
-            io.o(f"{n}", nl=True)
-            return 0
-        for f in fs:
-            try:
-                data = await rf(vrel(await ws_abspath(st, f)))
-                n = _count_lines(data)
-                total += n
-                io.o(f"{n}\t{f}", nl=True)
-            except Exception:
-                ex = 1
-        if modes and len(fs) > 1:
-            io.o(f"{total}\ttotal", nl=True)
-        return ex
-
-    if cmd == "grep":
-        ign = "-i" in argv
-        rest = [a for a in argv[1:] if a != "-i"]
-        if len(rest) < 1:
-            io.e("grep: missing pattern")
-            return 2
-        pat = rest[0]
-        fn = rest[1] if len(rest) > 1 else None
-        flags = re.I if ign else 0
-        try:
-            cre = re.compile(pat, flags)
-        except re.error as er:
-            io.e(str(er))
-            return 2
-        if fn is None:
-            data = io.inp or ""
-        else:
-            try:
-                data = await rf(vrel(await ws_abspath(st, fn)))
-            except Exception:
-                return 2
-        hit = 0
-        for i, line in enumerate(data.split("\n")):
-            if i > MAX_GREP:
-                break
-            if cre.search(line):
-                io.o(line, nl=True)
-                hit += 1
-        return 0 if hit else 1
-
-    if cmd == "awk":
-        return await run_awk(argv, st, io)
-    if cmd == "sed":
-        return await run_sed(argv, st, io)
-    if cmd == "curl":
-        return await run_curl(argv, st, io)
-    return 127
+            await laika_delete_file(rel)
+        except Exception as exc:
+            io.write_err(f"rmdir: {path}: {exc}")
+            exit_code = 1
+    return exit_code
 
 
 def _count_lines(data: str) -> int:
     if not data:
         return 0
-    return len(data.split("\n")) - (1 if data.endswith("\n") else 0)
+    return data.count("\n") if data.endswith("\n") else data.count("\n") + 1
 
 
-def sh_quote(v: str) -> str:
-    return v if re.match(r"^[\w@%+=:,./-]+$", v) else "'" + v.replace("'", "'\\''") + "'"
+@register_command("wc")
+async def cmd_wc(argv: List[str], st: Session, io: IO) -> int:
+    lines_only = "-l" in argv
+    files = [a for a in argv[1:] if not a.startswith("-")]
+    total = 0
+
+    if not files:
+        data = io.stdin_text
+        n = _count_lines(data)
+        io.write(str(n), newline=True)
+        return 0
+
+    exit_code = 0
+    for path in files:
+        try:
+            data = await _read_file_or_empty(vrel(await resolve_path(st, path)))
+            n = _count_lines(data)
+            total += n
+            io.write(f"{n}\t{path}", newline=True)
+        except Exception as exc:
+            exit_code = 1
+            io.write_err(f"wc: {path}: {exc}")
+
+    if lines_only and len(files) > 1:
+        io.write(f"{total}\ttotal", newline=True)
+
+    return exit_code
 
 
-async def run_awk(argv: List[str], st: _Ses, io: IO) -> int:
-    # awk [-Fsep] 'prog' [file]
-    i = 1
-    sep = None
-    if len(argv) > i and argv[i] == "-F":
-        sep = argv[i + 1]
-        i += 2
-    if len(argv) <= i:
+@register_command("grep")
+async def cmd_grep(argv: List[str], st: Session, io: IO) -> int:
+    ignore_case = "-i" in argv
+    rest = [a for a in argv[1:] if a != "-i"]
+
+    if not rest:
+        io.write_err("grep: missing pattern")
         return 2
-    prog = argv[i]
-    i += 1
-    fn = argv[i] if len(argv) > i else None
-    data = io.inp if fn is None else await laika_read_file(vrel(await ws_abspath(st, fn)))
-    lines = data.split("\n")
-    if not sep:
-        ss = lambda ln: ln.split()
+
+    pattern = rest[0]
+    filename = rest[1] if len(rest) > 1 else None
+
+    flags = re.I if ignore_case else 0
+    try:
+        cre = re.compile(pattern, flags)
+    except re.error as exc:
+        io.write_err(str(exc))
+        return 2
+
+    if filename is None:
+        data = io.stdin_text or ""
     else:
-        ss = lambda ln: ln.split(sep)
+        try:
+            data = await _read_file_or_empty(vrel(await resolve_path(st, filename)))
+        except Exception as exc:
+            io.write_err(f"grep: {filename}: {exc}")
+            return 2
 
-    def act_print_fields(ln: str, nr: int, fs: Optional[str]) -> None:
-        if "print" not in prog:
-            return
-        m = re.match(r"^\{([^}]*)\}\s*$", prog.strip())
-        if not m:
-            io.e("awk: only {print …} subset")
-            return
-        inner = m.group(1).strip()
-        flds = ss(ln) if ln else []
-        if inner == "" or inner == "0":
-            io.o(ln, nl=True)
-            return
-        toks = re.split(r"\s*,\s*", inner.replace("print", "").strip())
-        out: List[str] = []
-        for t in toks:
-            t = t.strip()
-            if t.startswith("$"):
-                idx = t[1:]
-                if idx.isdigit():
-                    j = int(idx)
-                    out.append(flds[j - 1] if 0 < j <= len(flds) else "")
-                elif idx == "NF":
-                    out.append(str(len(flds)))
-                elif idx == "NR":
-                    out.append(str(nr))
-                else:
-                    out.append("")
-            else:
-                out.append(t.strip("'\""))
-        io.o(" ".join(out), nl=True)
+    hits = 0
+    for line in data.split("\n")[:MAX_GREP_LINES]:
+        if cre.search(line):
+            io.write(line, newline=True)
+            hits += 1
 
-    for nr, ln in enumerate(lines, 1):
-        if not ln and nr == len(lines):
+    return 0 if hits else 1
+
+
+@register_command("awk")
+async def cmd_awk(argv: List[str], st: Session, io: IO) -> int:
+    idx = 1
+    sep: Optional[str] = None
+    if len(argv) > idx and argv[idx] == "-F":
+        if len(argv) <= idx + 1:
+            io.write_err("awk: missing separator")
+            return 2
+        sep = argv[idx + 1]
+        idx += 2
+
+    if len(argv) <= idx:
+        return 2
+
+    prog = argv[idx]
+    idx += 1
+    filename = argv[idx] if len(argv) > idx else None
+
+    data = io.stdin_text if filename is None else await _read_file_or_empty(
+        vrel(await resolve_path(st, filename))
+    )
+    lines = data.split("\n")
+
+    split_fn = (lambda ln: ln.split(sep)) if sep else (lambda ln: ln.split())
+
+    if "print" not in prog:
+        return 0
+
+    m = re.match(r"^\{([^}]*)\}\s*$", prog.strip())
+    if not m:
+        io.write_err("awk: only {print …} subset supported")
+        return 2
+
+    inner = m.group(1).strip()
+
+    condition: Optional[str] = None
+    if "{" in prog:
+        pre = prog.split("{", 1)[0].strip()
+        if pre and not pre.startswith("BEGIN"):
+            condition = pre
+
+    for nr, line in enumerate(lines, 1):
+        if not line and nr == len(lines):
             break
-        pre = None
-        if "{" in prog:
-            pre, _ = prog.split("{", 1)
-        if pre and pre.strip() and not pre.strip().startswith("BEGIN"):
-            m2 = re.match(r"^(.+)\s*\{", prog)
-            if m2:
-                cond = m2.group(1).strip()
-                if cond.startswith("/") and cond.endswith("/"):
-                    if not re.search(cond[1:-1], ln):
-                        continue
-                elif cond.startswith("NR"):
-                    if not eval_nr(cond, nr):
-                        continue
-        act_print_fields(ln, nr, sep)
+
+        if condition:
+            if condition.startswith("/") and condition.endswith("/"):
+                if not re.search(condition[1:-1], line):
+                    continue
+            elif condition.startswith("NR"):
+                if not _eval_nr_condition(condition, nr):
+                    continue
+
+        fields = split_fn(line) if line else []
+        if inner == "" or inner == "0":
+            io.write(line, newline=True)
+            continue
+
+        toks = re.split(r"\s*,\s*", inner.replace("print", "").strip())
+        out_parts: List[str] = []
+        for tok in toks:
+            tok = tok.strip()
+            if tok.startswith("$"):
+                idx_str = tok[1:]
+                if idx_str.isdigit():
+                    j = int(idx_str)
+                    out_parts.append(fields[j - 1] if 0 < j <= len(fields) else "")
+                elif idx_str == "NF":
+                    out_parts.append(str(len(fields)))
+                elif idx_str == "NR":
+                    out_parts.append(str(nr))
+                else:
+                    out_parts.append("")
+            else:
+                out_parts.append(tok.strip("'\""))
+        io.write(" ".join(out_parts), newline=True)
+
     return 0
 
 
-def eval_nr(cond: str, nr: int) -> bool:
+def _eval_nr_condition(cond: str, nr: int) -> bool:
     m = re.match(r"NR\s*(<=|>=|<|>|==)\s*(\d+)", cond.replace(" ", ""))
     if not m:
         return True
     op, kk = m.group(1), int(m.group(2))
-    if op == "<=":
-        return nr <= kk
-    if op == ">=":
-        return nr >= kk
-    if op == "<":
-        return nr < kk
-    if op == ">":
-        return nr > kk
-    return nr == kk
+    return {
+        "<=": lambda x, y: x <= y,
+        ">=": lambda x, y: x >= y,
+        "<": lambda x, y: x < y,
+        ">": lambda x, y: x > y,
+        "==": lambda x, y: x == y,
+    }[op](nr, kk)
 
 
-async def run_sed(argv: List[str], st: _Ses, io: IO) -> int:
+@register_command("sed")
+async def cmd_sed(argv: List[str], st: Session, io: IO) -> int:
     if len(argv) < 2:
         return 2
+
     prog = argv[1]
-    fn = argv[2] if len(argv) > 2 else None
-    data = io.inp if fn is None else await laika_read_file(vrel(await ws_abspath(st, fn)))
+    filename = argv[2] if len(argv) > 2 else None
+    data = io.stdin_text if filename is None else await _read_file_or_empty(
+        vrel(await resolve_path(st, filename))
+    )
     lines = data.split("\n")
     out_lines: List[str] = []
 
     ms = re.match(r"s/([^/]*)/([^/]*)/(g)?", prog)
     if ms:
-        old, nw, gg = ms.group(1), ms.group(2), ms.group(3)
-        ct = 0 if gg else 1
+        old, new, gg = ms.group(1), ms.group(2), ms.group(3)
+        count = 0 if gg else 1
         try:
             pat = re.compile(re.escape(old))
-        except re.error as er:
-            io.e(str(er))
+        except re.error as exc:
+            io.write_err(str(exc))
             return 2
-        for ln in lines:
-            out_lines.append(pat.sub(nw, ln, count=ct))
+        for line in lines:
+            out_lines.append(pat.sub(new, line, count=count))
     elif prog.isdigit():
         n_ln = int(prog)
         body = lines[:-1] if lines and lines[-1] == "" else lines
-        for j, ln in enumerate(body, 1):
+        for j, line in enumerate(body, 1):
             if j == n_ln:
-                out_lines.append(ln)
+                out_lines.append(line)
     else:
-        io.e("sed: unsupported script")
+        io.write_err("sed: unsupported script")
         return 2
 
-    io.o("\n".join(out_lines) + ("\n" if out_lines else ""))
+    io.write("\n".join(out_lines) + ("\n" if out_lines else ""))
     return 0
 
 
-async def run_curl(argv: List[str], st: _Ses, io: IO) -> int:
+@register_command("browser-login")
+async def cmd_browser_login(argv: List[str], st: Session, io: IO) -> int:
+    """打开可见 Chromium（与会话 Cookie 共享 / 可先登录再爬）。"""
+    urls = [a for a in argv[1:] if a.startswith(("http://", "https://"))]
+    if len(urls) != 1:
+        io.write_err("browser-login: exactly one https URL required")
+        return 2
+    try:
+        await laika_browser_open_login(urls[0])
+        io.write("login window opened (session shared with browser-html / browser-md)", newline=True)
+    except Exception as exc:
+        io.write_err(str(exc))
+        return 1
+    return 0
+
+
+@register_command("browser-html")
+async def cmd_browser_html(argv: List[str], st: Session, io: IO) -> int:
+    """隐藏 Chromium 导航后抓取渲染完的 HTML。"""
+    args = argv[1:]
+    wait = "load"
+    urls: List[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--wait" and i + 1 < len(args):
+            wait = args[i + 1]
+            if wait not in _BROWSER_WAIT:
+                io.write_err("browser-html: --wait must be load|domcontentloaded|networkidle")
+                return 2
+            i += 2
+            continue
+        if a.startswith(("http://", "https://")):
+            urls.append(a)
+        i += 1
+    if len(urls) != 1:
+        io.write_err("browser-html: one http(s) URL required")
+        return 2
+    try:
+        html = await laika_browser_get_html(urls[0], wait_until=wait)
+        io.write(html)
+    except Exception as exc:
+        io.write_err(str(exc))
+        return 1
+    return 0
+
+
+@register_command("browser-md")
+async def cmd_browser_md(argv: List[str], st: Session, io: IO) -> int:
+    """同上，Python markdownify 转 Markdown；--full 整页 body（SPA 更全、更噪）。"""
+    args = argv[1:]
+    wait = "load"
+    mode = "readability"
+    if "--full" in args:
+        mode = "full"
+        args = [a for a in args if a != "--full"]
+    urls: List[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--wait" and i + 1 < len(args):
+            wait = args[i + 1]
+            if wait not in _BROWSER_WAIT:
+                io.write_err("browser-md: --wait must be load|domcontentloaded|networkidle")
+                return 2
+            i += 2
+            continue
+        if a.startswith(("http://", "https://")):
+            urls.append(a)
+        i += 1
+    if len(urls) != 1:
+        io.write_err("browser-md: one http(s) URL required")
+        return 2
+    try:
+        md = await laika_browser_get_markdown(urls[0], wait_until=wait, mode=mode)
+        io.write(md, newline=md.endswith("\n"))
+    except Exception as exc:
+        io.write_err(str(exc))
+        return 1
+    return 0
+
+
+@register_command("curl")
+async def cmd_curl(argv: List[str], st: Session, io: IO) -> int:
     args = argv[1:]
     silent = "-s" in args
-    meth, body, hdrs, outp = "GET", None, {}, None
-    i = 0
-    ua = ""
+    method, body, headers, out_path = "GET", None, {}, None
     urls: List[str] = []
+
+    i = 0
     while i < len(args):
         a = args[i]
         if a == "-s":
             i += 1
             continue
         if a == "-o" and i + 1 < len(args):
-            outp, i = args[i + 1], i + 2
+            out_path, i = args[i + 1], i + 2
             continue
         if a == "-X" and i + 1 < len(args):
-            meth, i = args[i + 1].upper(), i + 2
+            method, i = args[i + 1].upper(), i + 2
             continue
         if a == "-d" and i + 1 < len(args):
             body, i = args[i + 1], i + 2
@@ -764,46 +1199,59 @@ async def run_curl(argv: List[str], st: _Ses, io: IO) -> int:
             hh = args[i + 1]
             if ":" in hh:
                 k, v = hh.split(":", 1)
-                hdrs[k.strip()] = v.strip()
+                headers[k.strip()] = v.strip()
             i += 2
             continue
-        if a.startswith("http"):
+        if a.startswith(("http://", "https://")):
             urls.append(a)
             i += 1
             continue
         i += 1
+
     if not urls:
-        io.e("curl: missing URL")
+        io.write_err("curl: missing URL")
         return 2
+
     url = urls[0]
     try:
-        r = await laika_http_request(url, method=meth, headers=hdrs if hdrs else None, body=body)
+        r = await laika_http_request(
+            url, method=method, headers=headers if headers else None, body=body
+        )
         blob = r.get("body") if isinstance(r.get("body"), str) else json.dumps(r, ensure_ascii=False)
-        if outp:
-            await laika_write_file(vrel(await ws_abspath(st, outp)), blob)
+
+        if out_path:
+            await laika_write_file(vrel(await resolve_path(st, out_path)), blob)
             if not silent:
-                io.o(f"saved {outp}", nl=True)
+                io.write(f"saved {out_path}", newline=True)
         else:
             if not silent:
-                io.o(blob, nl=isinstance(blob, str) and blob.endswith("\n"))
-    except Exception as e:
-        io.e(str(e))
+                io.write(blob, newline=isinstance(blob, str) and blob.endswith("\n"))
+    except Exception as exc:
+        io.write_err(str(exc))
         return 1
     return 0
+
+
+# -----------------------------------------------------------------------------
+# Entry
+# -----------------------------------------------------------------------------
 
 
 async def laika_run_shell(src: str) -> int:
     if not src or not src.strip():
         return 0
-    st = sess()
+
+    st = get_session()
     try:
         trees = bashlex.parse(src)
-    except Exception as e:
-        print(f"bashlex: {e}", file=__import__("sys").stderr, flush=True)
-        st.lx = 2
+    except Exception as exc:
+        print(f"bashlex: {exc}", file=sys.stderr, flush=True)
+        st.last_exit_code = 2
         return 2
-    lx = 0
+
+    exit_code = 0
     io = IO()
-    for tr in trees:
-        lx = await run_ast(tr, st, io)
-    return lx
+    for tree in trees:
+        exit_code = await run_ast(tree, st, io)
+
+    return exit_code
