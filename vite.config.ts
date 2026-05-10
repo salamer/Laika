@@ -66,6 +66,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
+        viewer: resolve(__dirname, 'viewer.html'),
         worker: resolve(__dirname, 'src/worker/pyodideWorker.ts'),
       },
       output: {

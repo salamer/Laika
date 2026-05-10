@@ -90,7 +90,7 @@ def vrel(v: str) -> str:
     return "." if v in ("/", ".") else v.strip("/")
 
 
-def joinv(cwd: str, seg: str) -> str:
+def ws_path_join(cwd: str, seg: str) -> str:
     base = [] if cwd in ("/", ".") else [x for x in cwd.strip("/").split("/") if x]
     for p in seg.split("/"):
         if not p or p == ".":
@@ -103,8 +103,8 @@ def joinv(cwd: str, seg: str) -> str:
     return "/" if not base else "/" + "/".join(base)
 
 
-async def abspath(st: _Ses, p: str) -> str:
-    return joinv("/", p.strip("/")) if p.startswith("/") else joinv(st.cwd, p)
+async def ws_abspath(st: _Ses, p: str) -> str:
+    return ws_path_join("/", p.strip("/")) if p.startswith("/") else ws_path_join(st.cwd, p)
 
 
 async def ew(w: Any, st: _Ses) -> str:
@@ -203,7 +203,7 @@ async def run_ast(node: Any, st: _Ses, io: IO, loc: Optional[Dict[str, str]] = N
                 pt = getattr(rd, "output", None)
                 ph = await ew(pt, st) if pt else ""
                 if typ == "<":
-                    stdin = await laika_read_file(vrel(await abspath(st, ph)))
+                    stdin = await laika_read_file(vrel(await ws_abspath(st, ph)))
                 elif typ == ">":
                     out_path, out_app = ph, False
                 elif typ == ">>":
@@ -238,7 +238,7 @@ async def run_ast(node: Any, st: _Ses, io: IO, loc: Optional[Dict[str, str]] = N
 
 
 async def wfile(st: _Ses, text: str, path: str, append: bool) -> None:
-    rel = vrel(await abspath(st, path))
+    rel = vrel(await ws_abspath(st, path))
     old = ""
     try:
         old = await laika_read_file(rel)
@@ -351,7 +351,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
         return 0
     if cmd == "cd":
         tg = argv[1] if len(argv) > 1 else st.env.get("HOME", "/")
-        nx = st.env.get("OLDPWD", "/") if tg == "-" else joinv(st.cwd, tg)
+        nx = st.env.get("OLDPWD", "/") if tg == "-" else ws_path_join(st.cwd, tg)
         if not await chkdir(nx):
             io.e(f"cd: {tg}: no such dir")
             return 1
@@ -392,7 +392,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
             ps = ["."]
         ex = 0
         for p in ps:
-            rel = vrel(await abspath(st, p))
+            rel = vrel(await ws_abspath(st, p))
             try:
                 rows = await lf(rel)
             except Exception:
@@ -422,7 +422,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
         ex = 0
         for f in argv[1:]:
             try:
-                io.o(await rf(vrel(await abspath(st, f))))
+                io.o(await rf(vrel(await ws_abspath(st, f))))
             except Exception:
                 ex = 1
                 io.e(f"cat: {f}")
@@ -435,7 +435,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
             n = int(argv[i + 1])
             i += 2
         fn = argv[i] if len(argv) > i else None
-        data = io.inp if fn is None else await rf(vrel(await abspath(st, fn)))
+        data = io.inp if fn is None else await rf(vrel(await ws_abspath(st, fn)))
         lines = data.split("\n")
         if cmd == "head":
             out = "\n".join(lines[:n]) + ("\n" if lines else "")
@@ -451,7 +451,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
             if p == "-p":
                 continue
             try:
-                await laika_mkdir(vrel(await abspath(st, p)))
+                await laika_mkdir(vrel(await ws_abspath(st, p)))
             except Exception:
                 ex = 1
         return ex
@@ -459,7 +459,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
     if cmd == "touch":
         ex = 0
         for p in argv[1:]:
-            rel = vrel(await abspath(st, p))
+            rel = vrel(await ws_abspath(st, p))
             try:
                 await rf(rel)
             except Exception:
@@ -472,8 +472,8 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
     if cmd == "mv":
         if len(argv) < 3:
             return 1
-        srel = vrel(await abspath(st, argv[1]))
-        drel = vrel(await abspath(st, argv[2]))
+        srel = vrel(await ws_abspath(st, argv[1]))
+        drel = vrel(await ws_abspath(st, argv[2]))
         try:
             body = await laika_read_file(srel)
         except Exception:
@@ -483,7 +483,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
         try:
             await laika_list_files(drel)
             base = argv[1].rstrip("/").split("/")[-1]
-            dest = vrel(await abspath(st, argv[2].rstrip("/") + "/" + base))
+            dest = vrel(await ws_abspath(st, argv[2].rstrip("/") + "/" + base))
         except Exception:
             pass
         try:
@@ -498,7 +498,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
             return 1
         rec = "-r" in argv or "-R" in argv
         xs = [a for a in argv[1:] if a not in ("-r", "-R")]
-        dst = vrel(await abspath(st, xs[-1]))
+        dst = vrel(await ws_abspath(st, xs[-1]))
         ex = 0
         try:
             await lf(dst)
@@ -506,7 +506,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
         except Exception:
             d_isdir = False
         for s in xs[:-1]:
-            srel = vrel(await abspath(st, s))
+            srel = vrel(await ws_abspath(st, s))
             try:
                 body = await laika_read_file(srel)
                 target = dst
@@ -526,7 +526,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
         xs = [a for a in argv[1:] if a not in ("-r", "-R", "-f", "-rf", "-fr") and not a.startswith("-")]
         ex = 0
         for p in xs:
-            rel = vrel(await abspath(st, p))
+            rel = vrel(await ws_abspath(st, p))
             try:
                 await laika_delete_file(rel, rf_)
             except Exception:
@@ -537,7 +537,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
     if cmd == "rmdir":
         ex = 0
         for p in argv[1:]:
-            rel = vrel(await abspath(st, p))
+            rel = vrel(await ws_abspath(st, p))
             try:
                 if await lf(rel):
                     io.e(f"rmdir: not empty {p}")
@@ -560,7 +560,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
             return 0
         for f in fs:
             try:
-                data = await rf(vrel(await abspath(st, f)))
+                data = await rf(vrel(await ws_abspath(st, f)))
                 n = _count_lines(data)
                 total += n
                 io.o(f"{n}\t{f}", nl=True)
@@ -588,7 +588,7 @@ async def dispatch(cmd: str, argv: List[str], st: _Ses, io: IO) -> int:
             data = io.inp or ""
         else:
             try:
-                data = await rf(vrel(await abspath(st, fn)))
+                data = await rf(vrel(await ws_abspath(st, fn)))
             except Exception:
                 return 2
         hit = 0
@@ -631,7 +631,7 @@ async def run_awk(argv: List[str], st: _Ses, io: IO) -> int:
     prog = argv[i]
     i += 1
     fn = argv[i] if len(argv) > i else None
-    data = io.inp if fn is None else await laika_read_file(vrel(await abspath(st, fn)))
+    data = io.inp if fn is None else await laika_read_file(vrel(await ws_abspath(st, fn)))
     lines = data.split("\n")
     if not sep:
         ss = lambda ln: ln.split()
@@ -710,7 +710,7 @@ async def run_sed(argv: List[str], st: _Ses, io: IO) -> int:
         return 2
     prog = argv[1]
     fn = argv[2] if len(argv) > 2 else None
-    data = io.inp if fn is None else await laika_read_file(vrel(await abspath(st, fn)))
+    data = io.inp if fn is None else await laika_read_file(vrel(await ws_abspath(st, fn)))
     lines = data.split("\n")
     out_lines: List[str] = []
 
@@ -780,7 +780,7 @@ async def run_curl(argv: List[str], st: _Ses, io: IO) -> int:
         r = await laika_http_request(url, method=meth, headers=hdrs if hdrs else None, body=body)
         blob = r.get("body") if isinstance(r.get("body"), str) else json.dumps(r, ensure_ascii=False)
         if outp:
-            await laika_write_file(vrel(await abspath(st, outp)), blob)
+            await laika_write_file(vrel(await ws_abspath(st, outp)), blob)
             if not silent:
                 io.o(f"saved {outp}", nl=True)
         else:

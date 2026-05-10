@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { auditLog } from '../security/audit';
+import { auditLog } from '../logging';
 
 export function initWorkspace(workspacePath: string): void {
   if (!existsSync(workspacePath)) {

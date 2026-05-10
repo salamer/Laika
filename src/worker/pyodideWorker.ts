@@ -1,11 +1,13 @@
 /// <reference lib="webworker" />
 
+/** Pyodide 0.25+ (and PDF.js) call `Promise.try`; Electron’s Chromium often lacks it. */
+import '../renderer/polyfills/promiseTry';
+
 import type { WorkerCommand, WorkerExecuteCommand, WorkerResponse } from '../types/worker';
 import { PRELOAD_PYODIDE_PACKAGES, PRELOAD_PYPI_PACKAGES } from './preloadPackages';
 
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-expect-error Vite raw import
 import laikaShellSource from './python/laika_shell.py?raw';
+import laikaFsSource from './python/laika_fs.py?raw';
 
 const PYODIDE_VERSION = '0.25.1';
 const PYODIDE_CDN = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -89,8 +91,12 @@ function pyOptsToJson(opts: unknown): string {
 
 const hostAPIBridge = {
   readFile: (path: string) => hostCall<string>('readFile', [path], 15_000),
+  readFileBase64: (path: string) => hostCall<string>('readFileBase64', [path], 120_000),
   writeFile: (path: string, content: string) => hostCall<void>('writeFile', [path, content], 15_000),
+  writeFileBase64: (path: string, contentBase64: string) =>
+    hostCall<void>('writeFileBase64', [path, contentBase64], 120_000),
   listFiles: (path = '.') => hostCall<unknown[]>('listFiles', [path], 15_000),
+  statFile: (path: string) => hostCall<string>('statFile', [path], 15_000),
   mkdir: (path: string) => hostCall<void>('mkdir', [path], 15_000),
   getWorkspaceInfo: () => hostCall<string>('workspaceInfo', [], 5_000),
   resolveWorkspacePath: (path: string) => hostCall<string>('workspaceResolvePath', [path], 5_000),
@@ -189,6 +195,20 @@ async def laika_read_file(path: str) -> str:
     return await hostAPI.readFile(path)
 
 
+async def laika_read_file_bytes(path: str) -> bytes:
+    """二进制读入（宿主 Base64）；配合 io.BytesIO + 预装第三方库解析。"""
+    import base64
+    b64 = await hostAPI.readFileBase64(path)
+    return base64.b64decode(b64)
+
+
+async def laika_write_file_bytes(path: str, content: bytes) -> None:
+    """二进制写入（需写入权限）；PDF/Office 等均经此序列化落盘。"""
+    import base64
+    b64 = base64.b64encode(content).decode("ascii")
+    await hostAPI.writeFileBase64(path, b64)
+
+
 async def laika_write_file(path: str, content: str) -> None:
     """写文本 UTF-8。单文件最大约 50MB。"""
     await hostAPI.writeFile(path, content)
@@ -205,8 +225,14 @@ async def laika_list_files(path: str = "."):
     return items.to_py() if hasattr(items, "to_py") else list(items)
 
 
+async def laika_stat_dict(path: str) -> dict:
+    """元数据字典：size / is_directory / modified_ms。"""
+    raw = await hostAPI.statFile(path)
+    return json.loads(raw)
+
+
 async def laika_workspace_info():
-    """返回 { virtualRoot, workspaceRoot }；workspaceRoot 即本机工作区绝对路径（与侧栏一致）。"""
+    """返回 { virtualRoot, workspaceRoot, workspaceWriteEnabled }；绝对路径与工作区对齐；写入由应用内授权开关控制。"""
     raw = await hostAPI.getWorkspaceInfo()
     return json.loads(raw)
 
@@ -237,6 +263,13 @@ async def laika_delete_file(path: str, recursive: bool = False) -> None:
     emitStdout('[Laika] compiling laika_shell.py (bashlex)\\n');
     await runtime.runPythonAsync(
       `exec(compile(${JSON.stringify(laikaShellSource)}, 'laika_shell.py', 'exec'))`
+    );
+
+    emitStdout('[Laika] compiling laika_fs.py (posix-like workspace API)\\n');
+    await runtime.runPythonAsync(`exec(compile(${JSON.stringify(laikaFsSource)}, 'laika_fs.py', 'exec'))`);
+
+    emitStdout(
+      '[Laika] Workspace FS: import laika_fs · await laika_fs.listdir(".") · read_bytes / write_bytes …\n'
     );
 
     pyodide = runtime;

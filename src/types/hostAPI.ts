@@ -52,8 +52,11 @@ export type HostBrowserEvaluate = {
 
 export interface HostAPIBridge {
   readFile: (path: string) => Promise<string>;
+  readFileBase64: (path: string) => Promise<string>;
   writeFile: (path: string, content: string) => Promise<void>;
+  writeFileBase64: (path: string, contentBase64: string) => Promise<void>;
   listFiles: (path?: string) => Promise<unknown[]>;
+  statFile: (path: string) => Promise<string>;
   mkdir: (path: string) => Promise<void>;
   getWorkspaceInfo: () => Promise<string>;
   resolveWorkspacePath: (path: string) => Promise<string>;

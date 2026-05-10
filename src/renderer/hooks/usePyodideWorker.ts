@@ -58,8 +58,23 @@ export function usePyodideWorker() {
             result = response.data;
             break;
           }
+          case 'readFileBase64': {
+            const response = await window.electronAPI.file.readFileBase64(args[0] as string);
+            if (!response.success) throw new Error(response.error);
+            result = response.data;
+            break;
+          }
           case 'writeFile': {
             const response = await window.electronAPI.file.writeFile(
+              args[0] as string,
+              args[1] as string
+            );
+            if (!response.success) throw new Error(response.error);
+            result = null;
+            break;
+          }
+          case 'writeFileBase64': {
+            const response = await window.electronAPI.file.writeFileBase64(
               args[0] as string,
               args[1] as string
             );
@@ -71,6 +86,12 @@ export function usePyodideWorker() {
             const response = await window.electronAPI.file.listFiles(args[0] as string);
             if (!response.success) throw new Error(response.error);
             result = response.data;
+            break;
+          }
+          case 'statFile': {
+            const response = await window.electronAPI.file.stat(args[0] as string);
+            if (!response.success) throw new Error(response.error);
+            result = JSON.stringify(response.data);
             break;
           }
           case 'mkdir': {

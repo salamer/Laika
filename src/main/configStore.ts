@@ -2,9 +2,11 @@ import { app } from 'electron';
 import { join, resolve } from 'node:path';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 
-/** Shape read/written in `laika-settings.json` (only workspace root is persisted). */
+/** Persisted fields in `laika-settings.json`. */
 export interface PersistedConfig {
   workspaceRoot: string;
+  /** 宿主 file IPC / Python `hostAPI.writeFile` / 浏览器截图落地等写入是否允许（读始终允许）。 */
+  workspaceWriteEnabled: boolean;
 }
 
 const FILE_NAME = 'laika-settings.json';
@@ -18,28 +20,56 @@ export function settingsFilePath(): string {
   return join(app.getPath('userData'), FILE_NAME);
 }
 
+function defaults(): PersistedConfig {
+  return {
+    workspaceRoot: defaultWorkspacePath(),
+    workspaceWriteEnabled: false,
+  };
+}
+
 export function loadSettings(): PersistedConfig {
   const fp = settingsFilePath();
+  const base = defaults();
   if (!existsSync(fp)) {
-    return { workspaceRoot: defaultWorkspacePath() };
+    return base;
   }
   try {
     const raw = JSON.parse(readFileSync(fp, 'utf-8')) as Partial<PersistedConfig>;
-    if (typeof raw.workspaceRoot === 'string' && raw.workspaceRoot.trim().length > 0) {
-      return { workspaceRoot: resolve(raw.workspaceRoot.trim()) };
-    }
+    const ws =
+      typeof raw.workspaceRoot === 'string' && raw.workspaceRoot.trim().length > 0
+        ? resolve(raw.workspaceRoot.trim())
+        : base.workspaceRoot;
+    const we =
+      typeof raw.workspaceWriteEnabled === 'boolean'
+        ? raw.workspaceWriteEnabled
+        : base.workspaceWriteEnabled;
+    return {
+      workspaceRoot: ws,
+      workspaceWriteEnabled: we,
+    };
   } catch {
-    /* use default */
+    return base;
   }
-  return { workspaceRoot: defaultWorkspacePath() };
 }
 
 export function saveSettings(settings: PersistedConfig): void {
   const root = app.getPath('userData');
   mkdirSync(root, { recursive: true });
-  writeFileSync(
-    settingsFilePath(),
-    JSON.stringify({ workspaceRoot: settings.workspaceRoot }, null, 2),
-    'utf-8'
-  );
+  writeFileSync(settingsFilePath(), JSON.stringify(settings, null, 2), 'utf-8');
+}
+
+/** Merge into existing file. */
+export function updateSettings(patch: Partial<PersistedConfig>): PersistedConfig {
+  const cur = loadSettings();
+  const next: PersistedConfig = {
+    workspaceRoot: patch.workspaceRoot !== undefined ? patch.workspaceRoot : cur.workspaceRoot,
+    workspaceWriteEnabled:
+      patch.workspaceWriteEnabled !== undefined ? patch.workspaceWriteEnabled : cur.workspaceWriteEnabled,
+  };
+  saveSettings(next);
+  return next;
+}
+
+export function isWorkspaceWriteEnabled(): boolean {
+  return Boolean(loadSettings().workspaceWriteEnabled);
 }

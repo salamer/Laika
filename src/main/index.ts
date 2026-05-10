@@ -1,23 +1,37 @@
+/**
+ * Electron main 入口：生命周期、默认 session CSP、IPC、主窗口创建。
+ * 日志在 `./logging`，应在 `app.ready` 后立即 `initMainLogging()`。
+ */
 import { app, BrowserWindow, session } from 'electron';
 import { join } from 'node:path';
 import { registerAllIPCHandlers } from './ipc/registerAll';
 import { initWorkspace } from './ipc/workspace';
-import { initAuditLog } from './security/audit';
+import { initMainLogging, errorFields, logRecord } from './logging';
 import { attachNetworkGuards } from './network';
 import { loadSettings } from './configStore';
 import { setWorkspaceRoot } from './workspaceContext';
 import { getMainBundledDirs } from './paths';
 import { disposeBrowserRuntime } from './browserRuntime';
+import { registerPreviewPrivilegedSchemes, registerPreviewProtocolHandler } from './previewProtocol';
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 const bundled = getMainBundledDirs();
 const preloadPath = bundled.preload;
 
 process.on('uncaughtException', (err) => {
-  console.error('[main] uncaughtException:', err);
+  logRecord(
+    'fatal',
+    { audit: true, event: 'PROCESS_UNCAUGHT_EXCEPTION', ...errorFields(err) },
+    'uncaughtException'
+  );
 });
+
 process.on('unhandledRejection', (reason) => {
-  console.error('[main] unhandledRejection:', reason);
+  logRecord(
+    'error',
+    { audit: true, event: 'PROCESS_UNHANDLED_REJECTION', ...errorFields(reason) },
+    'unhandledRejection'
+  );
 });
 
 if (process.platform === 'win32') {
@@ -31,13 +45,15 @@ if (!gotSingleInstanceLock) {
   process.exit(0);
 }
 
+registerPreviewPrivilegedSchemes();
+
 function contentSecurityPolicy(): string {
   const isDev = Boolean(VITE_DEV_SERVER_URL);
   const scriptSrc = isDev
     ? ["'self'", "'unsafe-inline'", "'unsafe-eval'", "'wasm-unsafe-eval'", 'blob:', 'https:', 'http:']
     : ["'self'", "'unsafe-eval'", "'wasm-unsafe-eval'", 'blob:', 'https:', 'http:'];
 
-  const connect = ["'self'", 'https:', 'http:', 'ws:', 'wss:'];
+  const connect = ["'self'", 'https:', 'http:', 'ws:', 'wss:', 'laika-preview:'];
   if (VITE_DEV_SERVER_URL) {
     try {
       const dev = new URL(VITE_DEV_SERVER_URL);
@@ -51,11 +67,12 @@ function contentSecurityPolicy(): string {
     "default-src 'self'",
     `script-src ${scriptSrc.join(' ')}`,
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: https:",
+    "img-src 'self' data: blob: https: laika-preview:",
     "font-src 'self' data: https:",
+    "media-src 'self' data: blob: https: laika-preview:",
     `connect-src ${connect.join(' ')}`,
     "worker-src 'self' blob:",
-    "frame-src 'none'",
+    "frame-src 'self' blob: laika-preview:",
     "object-src 'none'",
     "base-uri 'self'",
   ].join('; ');
@@ -75,10 +92,10 @@ async function createWindow(): Promise<void> {
   const isDev = Boolean(VITE_DEV_SERVER_URL);
 
   mainWindow = new BrowserWindow({
-    width: 960,
-    height: 720,
-    minWidth: 640,
-    minHeight: 480,
+    width: 1200,
+    height: 760,
+    minWidth: 840,
+    minHeight: 520,
     title: 'Laika',
     backgroundColor: '#0c0c0e',
     show: isDev,
@@ -140,10 +157,11 @@ app.whenReady().then(async () => {
     });
   });
 
-  initAuditLog();
+  initMainLogging();
   initWorkspace(settings.workspaceRoot);
   attachNetworkGuards(session.defaultSession);
-  registerAllIPCHandlers();
+  registerPreviewProtocolHandler();
+  registerAllIPCHandlers(() => mainWindow);
 
   await createWindow();
 

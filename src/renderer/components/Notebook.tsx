@@ -45,6 +45,22 @@ export default function Notebook() {
   const { status, execute, restart, initialize } = usePyodideWorker();
 
   useEffect(() => {
+    const onAppend = (ev: Event) => {
+      const ce = ev as CustomEvent<{ source?: string; kernelMode?: KernelMode }>;
+      const source = typeof ce.detail?.source === 'string' ? ce.detail.source : '';
+      const mode = ce.detail?.kernelMode;
+      if (mode === 'python' || mode === 'shell') {
+        setKernelMode(mode);
+      }
+      const cell = emptyCell();
+      cell.source = source;
+      setCells((prev) => [...prev, cell]);
+    };
+    window.addEventListener('laika-notebook-append-cell', onAppend);
+    return () => window.removeEventListener('laika-notebook-append-cell', onAppend);
+  }, []);
+
+  useEffect(() => {
     cellsRef.current = cells;
   }, [cells]);
 

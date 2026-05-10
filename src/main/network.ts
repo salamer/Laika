@@ -1,7 +1,8 @@
 import type { Session } from 'electron';
 import { URL } from 'node:url';
-import { auditLog } from './security/audit';
+import { auditLog } from './logging';
 
+/** 网络出口策略：`allow*` 用于 SSRF（默认会话 / IPC fetch）及嵌入 Chromium 的差异见各函数注释。 */
 function devServerOrigin(): URL | null {
   const raw = process.env.VITE_DEV_SERVER_URL;
   if (!raw) return null;
@@ -96,6 +97,24 @@ export function allowProxiedHttpRequest(urlStr: string): boolean {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
   if (isNonPublicHostname(url.hostname)) return false;
   return true;
+}
+
+/**
+ * URLs the embedded Chromium may navigate to (login window + automation share one session).
+ * = public internet **or** localhost-style dev hosts (so users can log in locally then scrape).
+ */
+export function allowBrowserNavUrl(urlStr: string): boolean {
+  if (allowProxiedHttpRequest(urlStr)) return true;
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase();
+    if (h === 'localhost' || h === '127.0.0.1') return true;
+    if (h.endsWith('.localhost')) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export function attachNetworkGuards(sess: Session): void {

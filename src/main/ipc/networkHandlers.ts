@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron';
-import { auditLog } from '../security/audit';
+import { auditLog, errorFields } from '../logging';
 import { allowProxiedHttpRequest } from '../network';
 import { IPC_CHANNELS } from '../../types/ipc';
 
@@ -64,7 +64,7 @@ export function registerNetworkHandlers(): void {
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown network error';
-        auditLog.error('NETWORK_ERROR', { url: payload.url, error: message });
+        auditLog.error('NETWORK_ERROR', { url: payload.url, message, ...errorFields(error) });
         return { success: false, error: message, requestId: payload.requestId };
       }
     }

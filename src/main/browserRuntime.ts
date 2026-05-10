@@ -1,3 +1,7 @@
+/**
+ * Python `hostAPI.browser.*` 使用的隐藏 BrowserWindow：`browserSession` 同一分区，
+ * `navigateAndWait` 负责导航与就绪信号；不向用户展示窗口。
+ */
 import { BrowserWindow } from 'electron';
 import type { WebContents } from 'electron';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -8,12 +12,14 @@ import type {
   BrowserScreenshotPayload,
   GotoWaitUntil,
 } from '../types/browserIpc';
-import { allowProxiedHttpRequest } from './network';
+import { allowBrowserNavUrl } from './network';
+import { BROWSER_SESSION_PARTITION, EMBEDDED_BROWSER_USER_AGENT } from './browserSession';
+import { disposeBrowserLoginWindow } from './browserLogin';
 import { getPathValidator } from './workspaceContext';
-import { auditLog } from './security/audit';
+import { isWorkspaceWriteEnabled } from './configStore';
+import { auditLog, scoped } from './logging';
 
-const DEFAULT_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Laika/1.0';
+const blog = scoped('browser.embedded');
 const MAX_HTML_BYTES = 20 * 1024 * 1024;
 const MIN_VIEWPORT = { width: 1280, height: 720 };
 
@@ -32,7 +38,7 @@ function getOrCreateWindow(): BrowserWindow {
       contextIsolation: true,
       sandbox: true,
       devTools: false,
-      partition: 'persist:laika-browser-automation',
+      partition: BROWSER_SESSION_PARTITION,
     },
   });
   automationWindow.on('closed', () => {
@@ -41,13 +47,13 @@ function getOrCreateWindow(): BrowserWindow {
   return automationWindow;
 }
 
-function assertPublicHttpUrl(url: string): void {
+function assertBrowserNavUrl(url: string): void {
   if (!url || typeof url !== 'string') {
     throw new Error('browser: url is required');
   }
-  if (!allowProxiedHttpRequest(url)) {
+  if (!allowBrowserNavUrl(url)) {
     throw new Error(
-      'Browser navigation blocked: only public http(s) URLs are allowed (no localhost / private networks).'
+      'Browser navigation blocked: use public https/http URLs, or http(s)://localhost / 127.0.0.1 for local dev.'
     );
   }
 }
@@ -59,7 +65,9 @@ async function navigateAndWait(
   timeoutMs: number
 ): Promise<void> {
   const wc = win.webContents;
-  assertPublicHttpUrl(url);
+  assertBrowserNavUrl(url);
+
+  blog.debug({ url, waitUntil, timeoutMs }, 'navigate:start');
 
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -111,7 +119,7 @@ async function navigateAndWait(
       wc.once('did-finish-load', onFinish);
     }
 
-    void wc.loadURL(url, { userAgent: DEFAULT_UA }).catch((err) => {
+    void wc.loadURL(url, { userAgent: EMBEDDED_BROWSER_USER_AGENT }).catch((err) => {
       cleanup();
       reject(err instanceof Error ? err : new Error(String(err)));
     });
@@ -133,7 +141,7 @@ async function runUserScript(wc: WebContents, script: string): Promise<unknown> 
 }
 
 export async function browserGetHtml(payload: BrowserGetHtmlPayload): Promise<string> {
-  assertPublicHttpUrl(payload.url);
+  assertBrowserNavUrl(payload.url);
   const waitUntil = payload.waitUntil ?? 'load';
   const timeoutMs = Math.min(Math.max(payload.timeoutMs ?? 60_000, 5_000), 180_000);
   const win = getOrCreateWindow();
@@ -154,7 +162,12 @@ export async function browserGetHtml(payload: BrowserGetHtmlPayload): Promise<st
 export async function browserScreenshot(
   payload: BrowserScreenshotPayload
 ): Promise<{ path: string; width: number; height: number }> {
-  assertPublicHttpUrl(payload.url);
+  if (!isWorkspaceWriteEnabled()) {
+    throw new Error(
+      '工作区写入未启用：无法保存截图到工作区路径，请在侧边横幅或设置中启用写入权限。'
+    );
+  }
+  assertBrowserNavUrl(payload.url);
   const pv = getPathValidator();
   const safePath = pv.validate(payload.path.replace(/\\/g, '/'));
   const waitUntil = payload.waitUntil ?? 'load';
@@ -184,7 +197,7 @@ export async function browserScreenshot(
 }
 
 export async function browserEvaluate(payload: BrowserEvaluatePayload): Promise<unknown> {
-  assertPublicHttpUrl(payload.url);
+  assertBrowserNavUrl(payload.url);
   if (!payload.script || typeof payload.script !== 'string') {
     throw new Error('browser.evaluate: script is required');
   }
@@ -198,6 +211,7 @@ export async function browserEvaluate(payload: BrowserEvaluatePayload): Promise<
 }
 
 export function disposeBrowserRuntime(): void {
+  disposeBrowserLoginWindow();
   if (automationWindow && !automationWindow.isDestroyed()) {
     automationWindow.destroy();
   }
